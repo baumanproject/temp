@@ -1,0 +1,61 @@
+# ------- Dify: обязательные -------
+# Сгенерируйте однажды и больше не меняйте (иначе инвалидируются ключи)
+# macOS/Linux:  openssl rand -base64 42
+SECRET_KEY=**paste-strong-random-key**
+
+# ------- PostgreSQL -------
+DB_HOST=db
+DB_PORT=5432
+DB_DATABASE=dify
+DB_USERNAME=dify
+DB_PASSWORD=**strong-db-password**
+
+# ------- Redis / Celery -------
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_DB=0
+CELERY_BROKER_URL=redis://redis:6379/1
+
+# ------- S3 (MinIO) -------
+# Внутренний endpoint для контейнеров (compose-сеть)
+S3_ENDPOINT=http://minio:9000
+S3_BUCKET_NAME=dify
+S3_ACCESS_KEY=**minio-user**
+S3_SECRET_KEY=**minio-pass**
+S3_REGION=us-east-1
+S3_USE_AWS_MANAGED_IAM=false
+S3_USE_PATH_STYLE=true
+
+# Если публикуете MinIO за прокси/доменом, раскомментируйте:
+# MINIO_SERVER_URL=https://minio.example.com
+# MINIO_BROWSER_REDIRECT_URL=https://minio-console.example.com
+
+# ------- Qdrant (внешний) -------
+QDRANT_URL=http://qdrant.your.internal:6333
+QDRANT_API_KEY=
+
+# ------- Sandbox -------
+SANDBOX_API_KEY=dify-sandbox
+SANDBOX_GIN_MODE=release
+SANDBOX_WORKER_TIMEOUT=15
+SANDBOX_ENABLE_NETWORK=true
+# SANDBOX_HTTP_PROXY=http://ssrf_proxy:3128
+# SANDBOX_HTTPS_PROXY=http://ssrf_proxy:3128
+
+# ------- Публичные URL для UI/API (подставьте свои домены/порты) -------
+CONSOLE_API_URL=http://localhost:5001
+CONSOLE_WEB_URL=http://localhost:3000
+SERVICE_API_URL=http://localhost:5001
+APP_API_URL=http://localhost:5001
+APP_WEB_URL=http://localhost:3000
+# (опц.) Если нужно формировать прямые ссылки на файлы из S3/MinIO:
+# FILES_URL=https://minio.example.com
+
+# ------- OpenAI-совместимый endpoint (LiteLLM / on-prem) -------
+# Если LiteLLM не в этом compose, укажите его внешний адрес:
+OPENAI_API_BASE=http://litellm.your.internal:4000/v1
+
+# ------- Прочее -------
+DEPLOY_ENV=PRODUCTION
+LOG_LEVEL=INFO
+MIGRATION_ENABLED=true
