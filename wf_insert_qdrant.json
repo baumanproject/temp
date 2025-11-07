@@ -1,0 +1,91 @@
+{
+  "name": "Form → Split Out → Placeholder → Summary",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Upload PDFs",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "PDF files",
+              "fieldType": "file",
+              "multipleFiles": true,
+              "acceptFileTypes": ".pdf",
+              "requiredField": true
+            }
+          ]
+        },
+        "responseMode": "lastNode",
+        "options": {
+          "buttonLabel": "Upload",
+          "path": "upload-pdfs"
+        }
+      },
+      "id": "form-trigger-1",
+      "name": "On form submission",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [-800, 0],
+      "webhookId": "00000000-0000-0000-0000-000000000001]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "={{$binary}}",
+        "options": {
+          "includeBinary": false
+        }
+      },
+      "id": "split-out-1",
+      "name": "Split Out ($binary)",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [-480, 0]
+    },
+    {
+      "parameters": {},
+      "id": "noop-1",
+      "name": "Placeholder (No Operation)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [-220, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Собираем имена файлов после Split Out/Placeholder и делаем HTML-резюме\nconst itemsAll = $input.all();\nconst rows = itemsAll.map((it, idx) => {\n  const keys = it.binary ? Object.keys(it.binary) : [];\n  const k = keys[0];\n  const bin = k ? it.binary[k] : null;\n  const name = bin?.fileName || `file_${idx+1}.pdf`;\n  return { name, ok: true };\n});\nconst list = rows.map(r => `<li>✅ ${r.name}</li>`).join('');\nconst html = `<h2>Готово</h2><p>Файлов обработано: <b>${rows.length}</b>.</p><ul>${list}</ul>`;\nreturn [{ json: { total: rows.length, succeeded: rows.length, failed: 0, summary_html: html } }];"
+      },
+      "id": "code-summary-1",
+      "name": "Build Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [60, 0]
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "responseText": "={{ $json.summary_html }}",
+        "options": {
+          "completionPageTitle": "Upload Result",
+          "formTitle": "Upload completed"
+        }
+      },
+      "id": "form-ending-1",
+      "name": "Form Ending",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 1,
+      "position": [360, 0],
+      "webhookId": "00000000-0000-0000-0000-000000000002"
+    }
+  ],
+  "connections": {
+    "On form submission": { "main": [[{ "node": "Split Out ($binary)", "type": "main", "index": 0 }]] },
+    "Split Out ($binary)": { "main": [[{ "node": "Placeholder (No Operation)", "type": "main", "index": 0 }]] },
+    "Placeholder (No Operation)": { "main": [[{ "node": "Build Summary", "type": "main", "index": 0 }]] },
+    "Build Summary": { "main": [[{ "node": "Form Ending", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "meta": {}
+}
