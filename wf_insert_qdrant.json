@@ -1,5 +1,5 @@
 {
-  "name": "Form → Split Out → Placeholder → Summary",
+  "name": "Form → SplitOut → OCR → Qdrant → Summary",
   "nodes": [
     {
       "parameters": {
@@ -24,41 +24,110 @@
       "id": "form-trigger-1",
       "name": "On form submission",
       "type": "n8n-nodes-base.formTrigger",
-      "typeVersion": 2.2,
-      "position": [-800, 0],
-      "webhookId": "00000000-0000-0000-0000-000000000001]
+      "typeVersion": 2.3,
+      "position": [-1180, 0]
     },
     {
       "parameters": {
-        "fieldToSplitOut": "={{$binary}}",
+        "fieldToSplitOut": "$binary",
+        "include": "noOtherFields",
         "options": {
+          "destinationFieldName": "binary.data",
           "includeBinary": false
         }
       },
       "id": "split-out-1",
-      "name": "Split Out ($binary)",
+      "name": "Split Out ($binary → binary.data)",
       "type": "n8n-nodes-base.splitOut",
       "typeVersion": 1,
-      "position": [-480, 0]
+      "position": [-860, 0]
     },
     {
-      "parameters": {},
-      "id": "noop-1",
-      "name": "Placeholder (No Operation)",
-      "type": "n8n-nodes-base.noOp",
-      "typeVersion": 1,
-      "position": [-220, 0]
+      "parameters": {
+        "method": "POST",
+        "url": "https://example.com/ocr",
+        "sendBody": "n8nBinaryFile",
+        "n8nBinaryDataFieldName": "data",
+        "options": {
+          "response": {
+            "responseFormat": "json"
+          },
+          "batching": {
+            "batchSize": 1,
+            "batchInterval": 250
+          }
+        }
+      },
+      "id": "ocr-http-1",
+      "name": "OCR (mock) — send binary 'data'",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [-600, 0],
+      "alwaysOutputData": true
     },
     {
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "// Собираем имена файлов после Split Out/Placeholder и делаем HTML-резюме\nconst itemsAll = $input.all();\nconst rows = itemsAll.map((it, idx) => {\n  const keys = it.binary ? Object.keys(it.binary) : [];\n  const k = keys[0];\n  const bin = k ? it.binary[k] : null;\n  const name = bin?.fileName || `file_${idx+1}.pdf`;\n  return { name, ok: true };\n});\nconst list = rows.map(r => `<li>✅ ${r.name}</li>`).join('');\nconst html = `<h2>Готово</h2><p>Файлов обработано: <b>${rows.length}</b>.</p><ul>${list}</ul>`;\nreturn [{ json: { total: rows.length, succeeded: rows.length, failed: 0, summary_html: html } }];"
+        "jsCode": "// Нормализуем ответ OCR в поле json.ocr_text и метаданные\nconst out = [];\nfor (const [i, it] of $input.all().entries()) {\n  const keys = Object.keys(it.binary || {});\n  const k = keys[0];\n  const bin = k ? it.binary[k] : null;\n  const name = bin?.fileName || `file_${i+1}.pdf`;\n  const o = it.json || {};\n  const text = o.text || o.ocr_text || o.data?.text || '';\n  out.push({ json: { file_name: name, ocr_text: String(text) }, binary: it.binary });\n}\nreturn out;"
+      },
+      "id": "code-normalize-ocr",
+      "name": "Normalize OCR text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-340, 0]
+    },
+    {
+      "parameters": {
+        "operationMode": "insertDocuments",
+        "qdrantCollectionName": "QDRANT_COLLECTION",
+        "subNodes": {
+          "documentLoader": {
+            "type": "n8n-nodes-langchain.documentDefaultDataLoader",
+            "parameters": {
+              "textSplitting": "custom",
+              "typeOfData": "json",
+              "mode": "loadSpecificData",
+              "data": "={{ $json.ocr_text }}",
+              "metadata": "={{ { file_name: $json.file_name } }}"
+            },
+            "subNodes": {
+              "textSplitter": {
+                "type": "n8n-nodes-langchain.textSplitterRecursiveCharacterTextSplitter",
+                "parameters": {
+                  "chunkSize": 1000,
+                  "chunkOverlap": 200
+                }
+              }
+            }
+          },
+          "embeddings": {
+            "type": "n8n-nodes-langchain.embeddingsOpenAI",
+            "parameters": {
+              "model": "text-embedding-3-small"
+            }
+          }
+        },
+        "options": {
+          "collectionConfig": ""
+        }
+      },
+      "id": "qdrant-insert-1",
+      "name": "Qdrant Vector Store (Insert Documents)",
+      "type": "n8n-nodes-langchain.vectorStoreQdrant",
+      "typeVersion": 1,
+      "position": [-40, 0],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Итоговый отчёт: сколько файлов успешно прошли OCR+Qdrant\nconst items = $input.all();\nconst rows = items.map((it, idx) => {\n  const name = it.json?.file_name || `file_${idx+1}.pdf`;\n  // помечаем успех, если у Qdrant узла ошибок нет (continueOnFail true — значит item есть всегда)\n  const ok = !(it.json?.error || it.json?.message?.includes('error'));\n  return { name, ok };\n});\nconst total = rows.length;\nconst succeeded = rows.filter(r => r.ok).length;\nconst failed = total - succeeded;\nconst list = rows.map(r => `<li>${r.ok ? '✅' : '❌'} ${r.name}</li>`).join('');\nconst html = `<h2>Готово</h2><p>Обработано: <b>${total}</b>. Успешно: <b>${succeeded}</b>, Ошибок: <b>${failed}</b>.</p><ul>${list}</ul>`;\nreturn [{ json: { total, succeeded, failed, summary_html: html } }];"
       },
       "id": "code-summary-1",
       "name": "Build Summary",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [60, 0]
+      "position": [260, 0]
     },
     {
       "parameters": {
@@ -71,18 +140,79 @@
         }
       },
       "id": "form-ending-1",
-      "name": "Form Ending",
+      "name": "Form Ending (Show Text)",
       "type": "n8n-nodes-base.form",
       "typeVersion": 1,
-      "position": [360, 0],
-      "webhookId": "00000000-0000-0000-0000-000000000002"
+      "position": [560, 0]
     }
   ],
   "connections": {
-    "On form submission": { "main": [[{ "node": "Split Out ($binary)", "type": "main", "index": 0 }]] },
-    "Split Out ($binary)": { "main": [[{ "node": "Placeholder (No Operation)", "type": "main", "index": 0 }]] },
-    "Placeholder (No Operation)": { "main": [[{ "node": "Build Summary", "type": "main", "index": 0 }]] },
-    "Build Summary": { "main": [[{ "node": "Form Ending", "type": "main", "index": 0 }]] }
+    "On form submission": {
+      "main": [
+        [
+          {
+            "node": "Split Out ($binary → binary.data)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out ($binary → binary.data)": {
+      "main": [
+        [
+          {
+            "node": "OCR (mock) — send binary 'data'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OCR (mock) — send binary 'data'": {
+      "main": [
+        [
+          {
+            "node": "Normalize OCR text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize OCR text": {
+      "main": [
+        [
+          {
+            "node": "Qdrant Vector Store (Insert Documents)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Qdrant Vector Store (Insert Documents)": {
+      "main": [
+        [
+          {
+            "node": "Build Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Summary": {
+      "main": [
+        [
+          {
+            "node": "Form Ending (Show Text)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
   },
   "active": false,
   "settings": { "executionOrder": "v1" },
