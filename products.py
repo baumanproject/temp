@@ -21,57 +21,30 @@ def iter_block_items(document):
 
 def _normalize_row_cells(row):
     """
-    Убираем дубли ячеек в строке.
-    Частая проблема кривых merge'ов — соседние ячейки полностью дублируют друг друга.
-    Считаем дубликатами подряд идущие ячейки с одинаковым XML.
+    Убираем дубли ячеек в строке (одинаковый XML подряд).
+    Частая проблема кривых merge'ов.
     """
     normalized = []
     prev_xml = None
     for cell in row.cells:
         xml = cell._tc.xml
         if xml == prev_xml:
-            # пропускаем дубль
             continue
         prev_xml = xml
         normalized.append(cell)
     return normalized
 
 
-def _safe_header_names(raw_headers):
-    """
-    Делает имена колонок уникальными и не пустыми.
-    """
-    headers = []
-    counter = {}
-
-    for i, h in enumerate(raw_headers):
-        name = h.strip()
-        if not name:
-            name = f"col_{i+1}"
-
-        base = name
-        if name in counter:
-            counter[base] += 1
-            name = f"{base}_{counter[base]}"
-        else:
-            counter[base] = 0
-
-        headers.append(name)
-    return headers
-
-
 def _extract_cell_value(cell):
     """
-    Достаём значение ячейки:
-    - если есть вложенные таблицы → JSON (dict / list)
-    - если только текст → строка
-    - если и текст, и таблицы → JSON с полями text + tables
+    Значение ячейки:
+    - вложенные таблицы → JSON
+    - текст → строка
+    - текст + таблицы → JSON {text, tables}
     """
-    # обычный текст
     texts = [p.text.strip() for p in cell.paragraphs if p.text.strip()]
     text = "\n".join(texts) if texts else ""
 
-    # вложенные таблицы
     nested_tables = list(cell.tables)
     nested_data = []
 
@@ -83,17 +56,16 @@ def _extract_cell_value(cell):
         return json.dumps(value, ensure_ascii=False)
 
     if nested_tables and not text:
-        # только таблицы
         return json.dumps(nested_data, ensure_ascii=False)
 
-    # только текст
     return text
 
 
 def _table_to_dicts(table):
     """
-    Превращает Table → список словарей (строки).
-    Вложенные таблицы в ячейках уже сериализуются в JSON.
+    Table → список словарей (строки).
+    Имена колонок: col_1, col_2, ...
+    Все строки считаются данными, никаких заголовков.
     """
     rows = list(table.rows)
     if not rows:
@@ -102,17 +74,16 @@ def _table_to_dicts(table):
     # нормализуем строки (убираем дубли ячеек)
     norm_rows = [_normalize_row_cells(r) for r in rows]
 
-    # заголовок
-    header_cells = norm_rows[0]
-    raw_headers = [_extract_cell_value(c) for c in header_cells]
-    headers = _safe_header_names(raw_headers)
+    # определяем максимальное число колонок
+    max_cols = max(len(r) for r in norm_rows) if norm_rows else 0
+    headers = [f"col_{i+1}" for i in range(max_cols)]
 
     result = []
 
-    for row_cells in norm_rows[1:]:
+    for row_cells in norm_rows:
         row_obj = {}
-        # гарантируем, что по каждому заголовку есть ключ
-        for idx, col_name in enumerate(headers):
+        for idx in range(max_cols):
+            col_name = headers[idx]
             cell_value = None
             if idx < len(row_cells):
                 cell_value = _extract_cell_value(row_cells[idx])
@@ -124,21 +95,17 @@ def _table_to_dicts(table):
 
 def extract_tables_with_text(docx_path):
     """
-    Основная функция.
-
-    На выходе:
+    На выходе список:
     [
         {
             "text_before": <str или None>,
-            "df": <pd.DataFrame>
+            "df": <pd.DataFrame с колонками col_i>
         },
         ...
     ]
     """
     doc = Document(docx_path)
     results = []
-
-    # буфер текста между предыдущей таблицей и текущей
     text_buffer = []
 
     for block in iter_block_items(doc):
@@ -148,11 +115,9 @@ def extract_tables_with_text(docx_path):
                 text_buffer.append(txt)
 
         elif isinstance(block, Table):
-            # текст перед таблицей (если он был)
             caption = "\n".join(text_buffer).strip() or None
             text_buffer = []
 
-            # конвертируем таблицу → список dict → DataFrame
             table_data = _table_to_dicts(block)
             df = pd.DataFrame(table_data) if table_data else pd.DataFrame()
 
@@ -167,7 +132,6 @@ def extract_tables_with_text(docx_path):
 
 
 if __name__ == "__main__":
-    # пример использования
     path = "example.docx"
     tables = extract_tables_with_text(path)
 
