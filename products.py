@@ -164,6 +164,47 @@ def load_table_from_csv(fname_csv):
     return df
 
 
+
+import os
+import json
+import pandas as pd
+
+# Ваша функция из предыдущего шага
+# from your_module import extract_tables_with_text  
+
+def process_folder(folder_path: str) -> list[dict]:
+    results = []
+    for fname in os.listdir(folder_path):
+        if fname.lower().endswith(".docx"):
+            full_path = os.path.join(folder_path, fname)
+            try:
+                tables = extract_tables_with_text(full_path)
+                # сериализуем каждый df в список словарей
+                serialized = []
+                for tbl in tables:
+                    # сериализуем DataFrame в list of dict
+                    serialized.append({
+                        "text_before": tbl["text_before"],
+                        "table": tbl["df"].to_dict(orient="records")
+                    })
+                results.append({
+                    "filename": fname,
+                    "tables": serialized
+                })
+            except Exception as e:
+                # логируем ошибку, но не прерываем весь цикл
+                print(f"Ошибка обработки {full_path}: {e}")
+    return results
+
+def main():
+    base_dir = "/data/products"
+    categories = ["ИСЖ", "ДСЖ", "НСЖ"]
+    all_results = {}
+
+    for cat in categories:
+        folder = os.path.join(base_dir, cat)
+        all_results[cat] = process_folder(folder)
+
 if __name__ == "__main__":
     tables = extract_tables_with_text("example.docx")
     save_tables_to_csv(tables, base_filename="mydoc")
