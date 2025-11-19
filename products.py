@@ -8,9 +8,6 @@ import json
 
 
 def iter_block_items(document):
-    """
-    Итерация по блокам документа (параграфы и таблицы) в порядке появления.
-    """
     body = document.element.body
     for child in body.iterchildren():
         if child.tag == qn("w:p"):
@@ -20,10 +17,6 @@ def iter_block_items(document):
 
 
 def _normalize_row_cells(row):
-    """
-    Убираем дубли ячеек в строке (одинаковый XML подряд).
-    Частая проблема кривых merge'ов.
-    """
     normalized = []
     prev_xml = None
     for cell in row.cells:
@@ -36,109 +29,99 @@ def _normalize_row_cells(row):
 
 
 def _extract_cell_value(cell):
-    """
-    Значение ячейки:
-    - вложенные таблицы → JSON
-    - текст → строка
-    - текст + таблицы → JSON {text, tables}
-    """
     texts = [p.text.strip() for p in cell.paragraphs if p.text.strip()]
     text = "\n".join(texts) if texts else ""
-
     nested_tables = list(cell.tables)
     nested_data = []
-
     for t in nested_tables:
         nested_data.append(_table_to_dicts(t))
-
     if nested_tables and text:
         value = {"text": text, "tables": nested_data}
         return json.dumps(value, ensure_ascii=False)
-
     if nested_tables and not text:
         return json.dumps(nested_data, ensure_ascii=False)
-
     return text
 
 
+def _cells_to_inner_table(cells):
+    if not cells:
+        return []
+    max_cols = len(cells)
+    headers = [f"col_{i+1}" for i in range(max_cols)]
+    row_obj = {headers[i]: _extract_cell_value(cells[i]) for i in range(max_cols)}
+    return [row_obj]
+
+
 def _table_to_dicts(table):
-    """
-    Table → список словарей (строки).
-    Имена колонок: col_1, col_2, ...
-    Все строки считаются данными, никаких заголовков.
-    """
     rows = list(table.rows)
     if not rows:
         return []
-
-    # нормализуем строки (убираем дубли ячеек)
     norm_rows = [_normalize_row_cells(r) for r in rows]
-
-    # определяем максимальное число колонок
-    max_cols = max(len(r) for r in norm_rows) if norm_rows else 0
-    headers = [f"col_{i+1}" for i in range(max_cols)]
-
+    first_row = norm_rows[0]
+    main_cols = len(first_row)
+    headers = [f"col_{i+1}" for i in range(main_cols)]
     result = []
-
     for row_cells in norm_rows:
-        row_obj = {}
-        for idx in range(max_cols):
-            col_name = headers[idx]
-            cell_value = None
-            if idx < len(row_cells):
-                cell_value = _extract_cell_value(row_cells[idx])
-            row_obj[col_name] = cell_value
+        row_obj = {h: None for h in headers}
+        cell_count = len(row_cells)
+        if cell_count <= main_cols:
+            # обычный случай: нет "распада"
+            for idx in range(cell_count):
+                row_obj[headers[idx]] = _extract_cell_value(row_cells[idx])
+        else:
+            # есть "распад" — надо выяснить к какой колонке
+            #  логика: сравниваем содержание первых main_cols-1 ячеек,
+            #  и оставшиеся считать "распадом" той колонки,
+            #  для которой ячейка (в первой main_cols) пустая или дублируется.
+            #  Простой эвристический подход:
+            for idx in range(main_cols):
+                if idx < len(row_cells):
+                    val = _extract_cell_value(row_cells[idx])
+                else:
+                    val = None
+                row_obj[headers[idx]] = val
+            # ищем колонку-индекс куда отнести лишние ячейки:
+            # например, если первые k ячеек похожи на первая строку,
+            # а далее идут лишние, то лишние относим к колонке k+1.
+            # Простой вариант: отнести лишние к последней колонке, у которой нет контента в этой строке
+            target_idx = None
+            for idx in range(main_cols):
+                if row_obj[headers[idx]] in (None, ""):
+                    target_idx = idx
+                    break
+            if target_idx is None:
+                target_idx = main_cols - 1
+            # собираем лишние ячейки
+            extra_cells = row_cells[main_cols:]
+            inner_cells = [row_cells[target_idx]] + extra_cells
+            inner_table = _cells_to_inner_table(inner_cells)
+            row_obj[headers[target_idx]] = json.dumps(inner_table, ensure_ascii=False)
         result.append(row_obj)
-
     return result
 
 
 def extract_tables_with_text(docx_path):
-    """
-    На выходе список:
-    [
-        {
-            "text_before": <str или None>,
-            "df": <pd.DataFrame с колонками col_i>
-        },
-        ...
-    ]
-    """
     doc = Document(docx_path)
     results = []
     text_buffer = []
-
     for block in iter_block_items(doc):
         if isinstance(block, Paragraph):
             txt = block.text.strip()
             if txt:
                 text_buffer.append(txt)
-
         elif isinstance(block, Table):
             caption = "\n".join(text_buffer).strip() or None
             text_buffer = []
-
             table_data = _table_to_dicts(block)
             df = pd.DataFrame(table_data) if table_data else pd.DataFrame()
-
-            results.append(
-                {
-                    "text_before": caption,
-                    "df": df,
-                }
-            )
-
+            results.append({"text_before": caption, "df": df})
     return results
 
 
 if __name__ == "__main__":
-    path = "example.docx"
-    tables = extract_tables_with_text(path)
-
+    tables = extract_tables_with_text("example.docx")
     for i, item in enumerate(tables, start=1):
         print(f"=== Таблица {i} ===")
-        print("Текст перед таблицей:")
-        print(item["text_before"])
-        print("\nDataFrame:")
+        print("Текст перед таблицей:", item["text_before"])
         print(item["df"])
-        print("\n" + "-" * 80 + "\n")
+        print("-" * 50)
