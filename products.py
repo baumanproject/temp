@@ -29,6 +29,7 @@ def iter_block_items(document):
 def _normalize_row_cells(row):
     """
     Убираем дублирующиеся подряд ячейки (одинаковый XML) — артефакт merge’ов.
+    Возвращаем список ячеек.
     """
     normalized = []
     prev_xml = None
@@ -94,8 +95,8 @@ def _is_index_column(rows, idx, max_rows=5):
     """
     score = 0
     n = min(len(rows), max_rows)
+    header = f"col_{idx+1}"
     for row in rows[:n]:
-        header = f"col_{idx+1}"
         if header not in row:
             continue
         val_json = row.get(header)
@@ -131,20 +132,17 @@ def _determine_main_cols(norm_rows):
     else:
         cols = min(counts)
 
-    # Подготавливаем заголовки col_1..col_cols
     headers = [f"col_{i+1}" for i in range(cols)]
-    # Подготовим образцы строк (до 5) как словари
     sample_rows = []
     for r in norm_rows[:5]:
         row_obj = {}
         for i in range(cols):
             if i < len(r):
-                row_obj[f"col_{i+1}"] = _extract_cell_json(r.cells[i])
+                row_obj[f"col_{i+1}"] = _extract_cell_json(r[i])
             else:
-                row_obj[f"col_{i+1}"] = json.dumps({"text": "", "table": ""}, ensure_ascii=False)
+                row_obj[f"col_{i+1}"] = json.dumps({"text":"", "table":""}, ensure_ascii=False)
         sample_rows.append(row_obj)
 
-    # Проверяем: является ли первая колонка индексной
     if _is_index_column(sample_rows, 0):
         return cols - 1, True
 
@@ -171,10 +169,8 @@ def _table_to_dicts(table):
     if main_cols <= 0:
         main_cols = len(norm_rows[0])
 
-    if dropped_index:
-        headers = [f"col_{i+1}" for i in range(main_cols)]
-    else:
-        headers = [f"col_{i+1}" for i in range(main_cols)]
+    drop_offset = 1 if dropped_index else 0
+    headers = [f"col_{i+1}" for i in range(main_cols)]
 
     result = []
     empty_json = json.dumps({"text": "", "table": ""}, ensure_ascii=False)
@@ -183,30 +179,22 @@ def _table_to_dicts(table):
         row_obj = {h: empty_json for h in headers}
         cell_count = len(row_cells)
 
-        if dropped_index:
-            # если индексная колонка снята, начинаем чтение с 2-й ячейки
-            offset = 1
-        else:
-            offset = 0
-
-        if cell_count - offset <= main_cols:
-            # обычный случай
+        if cell_count - drop_offset <= main_cols:
             for idx in range(main_cols):
-                src_idx = idx + offset
-                if src_idx < len(row_cells):
+                src_idx = idx + drop_offset
+                if src_idx < cell_count:
                     row_obj[headers[idx]] = _extract_cell_json(row_cells[src_idx])
                 else:
                     row_obj[headers[idx]] = empty_json
         else:
-            # есть «распад»
             for idx in range(main_cols):
-                src_idx = idx + offset
-                if src_idx < len(row_cells):
+                src_idx = idx + drop_offset
+                if src_idx < cell_count:
                     row_obj[headers[idx]] = _extract_cell_json(row_cells[src_idx])
                 else:
                     row_obj[headers[idx]] = empty_json
 
-            extra_cells = row_cells[offset + main_cols:]
+            extra_cells = row_cells[drop_offset + main_cols:]
             target_idx = None
             for idx in range(main_cols):
                 obj = json.loads(row_obj[headers[idx]])
@@ -216,7 +204,7 @@ def _table_to_dicts(table):
             if target_idx is None:
                 target_idx = main_cols - 1
 
-            inner_cells = [row_cells[offset + target_idx]] + extra_cells
+            inner_cells = [row_cells[drop_offset + target_idx]] + extra_cells
             inner_table = _cells_to_inner_table(inner_cells)
             row_obj[headers[target_idx]] = json.dumps(
                 {"text": "", "table": inner_table},
