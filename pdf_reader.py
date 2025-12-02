@@ -1,143 +1,109 @@
 import pdfplumber
 import pandas as pd
-import logging
-import json
-from typing import List, Dict, Tuple, Optional
+from typing import List, Optional, Tuple
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-class TableMeta:
-    def __init__(self, table_obj, page_num: int):
-        self.obj = table_obj
-        self.page_num = page_num
-        self.bbox: Tuple[float,float,float,float] = table_obj.bbox  # (x0, top, x1, bottom)
-        self.rows: List[List[Optional[str]]] = table_obj.extract()
-
-    def to_dataframe(self) -> pd.DataFrame:
-        return pd.DataFrame(self.rows)
-
-    def to_serializable(self):
-        return {
-            "page": self.page_num,
-            "bbox": self.bbox,
-            "rows": self.rows
-        }
-
-def extract_top_level_tables(pdf_path: str,
-                             start_marker: str = "паспорт продукта",
-                             end_marker: str = "приложение номер 1"
-                             ) -> List[Dict]:
-    """
-    Возвращает список словарей — для каждой top-level таблицы: её строка (as list of lists), bbox, страница,
-    и список вложенных таблиц (каждая как serializable dict).
-    """
-    in_range = False
-    page_with_start = None
-    start_y: Optional[float] = None
-    top_tables: List[Dict] = []
+def extract_top_level_tables(
+    pdf_path: str,
+    start_marker: str = "паспорт продукта",
+    end_marker: str = "приложение номер 1"
+) -> List[pd.DataFrame]:
+    tables_out: List[pd.DataFrame] = []
 
     with pdfplumber.open(pdf_path) as pdf:
-        logger.info("Открыт PDF '%s', страниц: %d", pdf_path, len(pdf.pages))
-
-        # временно храним таблицы на текущей странице
-        page_tables_buffer: List[TableMeta]
+        in_range = False
+        start_y: Optional[float] = None
+        page_with_start = None
 
         for page in pdf.pages:
             page_num = page.page_number
             text = page.extract_text() or ""
             low = text.lower()
 
-            if (not in_range) and (start_marker.lower() in low):
+            # если находим маркер начала — отмечаем старт
+            if not in_range and start_marker.lower() in low:
                 in_range = True
                 page_with_start = page_num
-                logger.info("Найден start_marker на странице %d", page_num)
-                found = page.search(start_marker, case=False, regex=False)
+                # пытаемся определить y-координату маркера, если pdfplumber поддерживает .search()
+                found = page.search(start_marker, case=False, regex=False) if hasattr(page, "search") else None
                 if found:
-                    start_y = found[0]['top']
-                    logger.info(" start_marker top y = %f", start_y)
+                    start_y = found[0]["top"]
 
             if in_range:
-                # собираем все таблицы на странице
-                page_tables_buffer = []
+                # найдём все таблицы на странице
                 try:
-                    tables = page.find_tables()
-                except Exception as e:
-                    logger.warning("Ошибка find_tables на странице %d: %s", page_num, e)
-                    tables = []
-                for tbl in tables:
-                    meta = TableMeta(tbl, page_num)
-                    page_tables_buffer.append(meta)
-                if page_tables_buffer:
-                    logger.info("Страница %d: найдено %d таблиц", page_num, len(page_tables_buffer))
+                    tbls = page.find_tables()
+                except Exception:
+                    tbls = []
 
-                # фильтрация таблиц по start / end маркеру + bbox
-                for meta in page_tables_buffer:
-                    x0, top, x1, bottom = meta.bbox
-                    # если на той же странице, что start — таблица должна быть ниже start_y
-                    if page_num == page_with_start and (start_y is not None):
-                        if bottom < start_y:
-                            logger.info("Таблица на странице %d bbox %s пропущена — выше start_marker", page_num, meta.bbox)
-                            continue
-                    # если end_marker есть — фильтрация по нему
-                    if end_marker.lower() in low:
-                        found_end = page.search(end_marker, case=False, regex=False)
-                        if found_end:
-                            end_y = found_end[0]['top']
-                            logger.info("Найден end_marker на странице %d, top y = %f", page_num, end_y)
-                            if top > end_y:
-                                logger.info("Таблица bbox %s пропущена — ниже end_marker", meta.bbox)
-                                continue
-                            # после этого — можем завершить диапазон
-                            in_range = False
+                # буфер — таблицы на этой странице
+                page_tables: List[Tuple[pdfplumber.table_table.Table, Tuple[float,float,float,float]]] = []
+                for tbl in tbls:
+                    try:
+                        bbox = tbl.bbox  # (x0, top, x1, bottom)
+                    except Exception:
+                        # если bbox недоступен — принимаем таблицу без bbox
+                        bbox = None
+                    page_tables.append((tbl, bbox))
 
-                    # добавляем в список кандидатов (временно)
-                # если есть candidate — нужно фильтровать вложенные
-                # проходимся по candidate-таблицам, отделяя top-level и nested
-                for outer in page_tables_buffer:
+                # фильтр вложенных: если bbox одной таблицы содержится в bbox другой — считаем вложенной
+                top_level = []
+                for i, (outer_tbl, outer_bbox) in enumerate(page_tables):
                     is_nested = False
-                    nested = []
-                    for inner in page_tables_buffer:
-                        if outer is inner:
-                            continue
-                        # если bbox inner полностью внутри bbox outer — считаем nested
-                        x0o, topo, x1o, boto = outer.bbox
-                        x0i, topi, x1i, boti = inner.bbox
-                        if (x0i >= x0o and x1i <= x1o and topi >= topo and boti <= boto):
-                            is_nested = True
-                            nested.append(inner.to_serializable())
-                    if not is_nested:
-                        # top-level table — сохраняем
-                        top_tables.append({
-                            "page": outer.page_num,
-                            "bbox": outer.bbox,
-                            "rows": outer.rows,
-                            "nested": nested  # список вложенных таблиц (в виде серилизованных dict)
-                        })
+                    if outer_bbox is None:
+                        # если нет bbox — пропускаем вложенность фильтр (берём как top-level)
+                        top_level.append(outer_tbl)
                     else:
-                        logger.info("Таблица на странице %d bbox %s — вложенная, пропускаем как top-level",
-                                    outer.page_num, outer.bbox)
-            if (not in_range) and (page_with_start is not None):
-                logger.info("Диапазон закончился на странице %d — прекращаем", page_num)
+                        x0o, top_o, x1o, bot_o = outer_bbox
+                        for j, (inner_tbl, inner_bbox) in enumerate(page_tables):
+                            if i == j or inner_bbox is None:
+                                continue
+                            x0i, top_i, x1i, bot_i = inner_bbox
+                            # если inner полностью внутри outer — treat inner as nested
+                            if x0i >= x0o and x1i <= x1o and top_i >= top_o and bot_i <= bot_o:
+                                is_nested = True
+                                break
+                        if not is_nested:
+                            top_level.append(outer_tbl)
+
+                for tbl in top_level:
+                    # опционально: фильтрация по bbox относительно start_marker на странице начала
+                    if page_num == page_with_start and start_y is not None:
+                        bbox = tbl.bbox if hasattr(tbl, "bbox") else None
+                        if bbox is not None:
+                            # если таблица выше start_marker — пропускаем
+                            if bbox[3] < start_y:
+                                continue
+
+                    # если на этой странице есть end_marker — можно прекратить после этого
+                    if end_marker.lower() in low:
+                        # но перед этим — можно фильтровать таблицы ниже end_marker
+                        found_end = page.search(end_marker, case=False, regex=False) if hasattr(page, "search") else None
+                        if found_end:
+                            end_y = found_end[0]["top"]
+                            bbox = tbl.bbox if hasattr(tbl, "bbox") else None
+                            if bbox is not None and bbox[1] > end_y:
+                                continue
+                            # после обработки — завершаем
+                        in_range = False
+
+                    # извлекаем строки таблицы
+                    try:
+                        raw = tbl.extract()
+                        df = pd.DataFrame(raw)
+                        tables_out.append(df)
+                    except Exception:
+                        continue
+
+            # если диапазон закончился — выходим
+            if not in_range and page_with_start is not None:
                 break
 
-    if not top_tables:
-        logger.warning("Не найдено top-level таблиц между маркерами")
-    else:
-        logger.info("Найдено top-level таблиц: %d", len(top_tables))
-
-    return top_tables
+    return tables_out
 
 
 if __name__ == "__main__":
-    path = "your_document.pdf"
-    result = extract_top_level_tables(path)
-    for idx, tbl in enumerate(result, start=1):
-        df = pd.DataFrame(tbl["rows"])
-        print(f"--- Table #{idx} (page {tbl['page']}), shape {df.shape}, nested count = {len(tbl['nested'])} ---")
+    pdf_path = "your_file.pdf"
+    tables = extract_top_level_tables(pdf_path)
+    for idx, df in enumerate(tables, start=1):
+        print(f"Table {idx}: {df.shape[0]} rows, {df.shape[1]} columns")
         print(df.head())
-        if tbl["nested"]:
-            print(" Nested tables json:", json.dumps(tbl["nested"], ensure_ascii=False))
