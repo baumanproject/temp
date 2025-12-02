@@ -1,50 +1,66 @@
 import pdfplumber
 import pandas as pd
+from typing import Optional, Tuple
 
-def extract_table_between_markers(pdf_path: str,
-                                  start_marker: str = "паспорт продукта",
-                                  end_marker: str = "приложение номер 1") -> pd.DataFrame | None:
-    """
-    Ищет таблицы в PDF между строками start_marker и end_marker.
-    Возвращает объединённый DataFrame со всей найденной таблицей,
-    или None, если ничего не найдено.
-    """
-    tables = []
-    collecting = False
+def extract_tables_between_markers_with_bbox(
+    pdf_path: str,
+    start_marker: str = "паспорт продукта",
+    end_marker: str = "приложение номер 1"
+) -> Optional[pd.DataFrame]:
+    in_range = False
+    collected_rows = []
 
     with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
+        for page in pdf.pages:
+            page_num = page.page_number
             text = page.extract_text() or ""
+            low = text.lower()
 
-            # Проверка начала таблицы
-            if (not collecting) and (start_marker.lower() in text.lower()):
-                collecting = True
-                # возможно — в этой же странице есть первая часть таблицы
+            # ищем маркер начала на странице
+            if (not in_range) and (start_marker.lower() in low):
+                # нашли — считаем, что дальше на этой и следующих стр. таблицы могут идти
+                in_range = True
+                # найдём y-координату этого маркера (примерно)
+                # используем page.search
+                found = page.search(start_marker, case=False, regex=False)
+                if found:
+                    # берем первую найденную — get top
+                    start_y = found[0]['top']
+                else:
+                    start_y = None
+            # если уже в диапазоне — ищем таблицы
+            if in_range:
+                # перегоняем все таблицы на странице
+                for table_obj in page.find_tables():
+                    bbox: Tuple[float, float, float, float] = table_obj.bbox  # x0, top, x1, bottom
+                    top_y = bbox[1]
+                    bottom_y = bbox[3]
 
-            if collecting:
-                # Попытка извлечь таблицы на странице
-                page_tables = page.extract_tables()
-                for table in page_tables:
-                    df = pd.DataFrame(table[1:], columns=table[0])  # предположим, что первая строка — header
-                    tables.append(df)
+                    # логика фильтрации:
+                    # — если мы на той же странице, что маркер начала: таблица должна быть **ниже** начала
+                    if 'start_y' in locals() and start_y is not None and page_num == page.page_number:
+                        if bottom_y < start_y:
+                            # таблица выше маркера — пропускаем
+                            continue
+                    # — если маркер конца найден на этой странице — таблицы ниже конца пропускаем
+                    if end_marker.lower() in low:
+                        # найдём y-координату маркера конца
+                        found_end = page.search(end_marker, case=False, regex=False)
+                        if found_end:
+                            end_y = found_end[0]['top']
+                            # таблица должна быть **выше** маркера конца
+                            if top_y > end_y:
+                                # таблица ниже конца — пропускаем
+                                continue
+                        # после обработки маркера конца — можно завершить всё
+                        in_range = False
 
-                # Проверка конца таблицы
-                if end_marker.lower() in text.lower():
-                    collecting = False
-                    break  # если таблица закончилась — можно выйти (или продолжить, если нужно)
-    if tables:
-        # Соединяем все куски таблицы по вертикали
-        full_table = pd.concat(tables, ignore_index=True)
-        return full_table
+                    # если таблица прошла фильтры — извлекаем текст
+                    raw = table_obj.extract()
+                    for row in raw:
+                        collected_rows.append(row)
+
+    if collected_rows:
+        return pd.DataFrame(collected_rows)
     else:
         return None
-
-if __name__ == "__main__":
-    path = "your_document.pdf"
-    df = extract_table_between_markers(path)
-    if df is not None:
-        print("Таблица извлечена, число строк:", len(df))
-        print(df.head())
-        df.to_csv("extracted_table.csv", index=False)
-    else:
-        print("Таблица не найдена между маркерами.")
