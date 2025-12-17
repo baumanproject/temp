@@ -1,14 +1,13 @@
+# insurance_attribute_agent_tools.py
+
 import json
 import os
-from dataclasses import dataclass
+import time
 
-from openai import OpenAI
+from openai import OpenAI, DefaultHttpxClient
+from openai import APIConnectionError, APITimeoutError
 from pydantic import BaseModel, RootModel, model_validator
 
-
-# ---------------------------
-# Config
-# ---------------------------
 
 class AgentConfig(BaseModel):
     litellm_base_url: str = "http://localhost:4000"
@@ -22,9 +21,15 @@ class AgentConfig(BaseModel):
     temperature: float = 0.0
     max_output_tokens: int = 1200
 
-    # Attempts
+    # Сколько "смысловых" LLM-вызовов (extract + fix и т.д.)
     max_total_calls: int = 3
-    max_fix_calls: int = 1  # сколько раз пробуем "починить" без исходного документа
+
+    # Fix без жирного документа: сколько раз можно попробовать
+    max_fix_calls: int = 1
+
+    # Retry по сети: если connection/timeout — повторяем запрос
+    connection_retries: int = 1
+    connection_retry_sleep_seconds: float = 0.5
 
     # Tracing
     trace_enabled: bool = True
@@ -33,26 +38,31 @@ class AgentConfig(BaseModel):
 
 
 class TokenUsageSummary(BaseModel):
-    calls: int = 0
+    # все попытки (включая connection retries)
+    attempts: int = 0
+    responses_received: int = 0
+
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
 
 
-# ---------------------------
-# Tracing
-# ---------------------------
-
 class TraceEvent(BaseModel):
     index: int
     purpose: str
+    attempt_no: int
     messages: list[dict[str, str]]
+
     tools_count: int
     tool_choice: dict | None
+
     assistant_content: str | None = None
     tool_arguments_raw: str | None = None
+
     parsed_result: dict[str, str | None] | None = None
     usage: dict[str, int] | None = None
+
+    error_kind: str | None = None   # "connection" | "validation" | "protocol" | "unknown"
     error: str | None = None
 
 
@@ -67,20 +77,28 @@ class AgentTracer:
     def events(self) -> list[TraceEvent]:
         return list(self._events)
 
-    def start(self, purpose: str, messages: list[dict], tools: list[dict], tool_choice: dict | None) -> int:
+    def start(
+        self,
+        purpose: str,
+        attempt_no: int,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: dict | None,
+    ) -> int:
         if not self._enabled:
             return -1
         self._i += 1
         ev = TraceEvent(
             index=self._i,
             purpose=purpose,
+            attempt_no=attempt_no,
             messages=[self._trim_msg(m) for m in messages],
             tools_count=len(tools),
             tool_choice=tool_choice,
         )
         self._events.append(ev)
         if self._do_print:
-            print(f"\n[TRACE] CALL #{ev.index} purpose={purpose} tools={len(tools)} tool_choice={tool_choice}")
+            print(f"\n[TRACE] CALL #{ev.index} purpose={purpose} attempt={attempt_no} tools={len(tools)}")
         return ev.index
 
     def finish(
@@ -90,6 +108,7 @@ class AgentTracer:
         tool_arguments_raw: str | None,
         parsed_result: dict[str, str | None] | None,
         usage: dict[str, int] | None,
+        error_kind: str | None,
         error: str | None,
     ) -> None:
         if not self._enabled or trace_id < 0:
@@ -97,13 +116,16 @@ class AgentTracer:
         ev = next((x for x in self._events if x.index == trace_id), None)
         if not ev:
             return
+
         ev.assistant_content = self._trim_text(assistant_content)
         ev.tool_arguments_raw = self._trim_text(tool_arguments_raw)
         ev.parsed_result = parsed_result
         ev.usage = usage
+        ev.error_kind = error_kind
         ev.error = error
+
         if self._do_print:
-            print(f"[TRACE] RESULT #{trace_id} usage={usage} error={error}")
+            print(f"[TRACE] RESULT #{trace_id} error_kind={error_kind} error={error} usage={usage}")
 
     def _trim_text(self, s: str | None) -> str | None:
         if s is None:
@@ -116,14 +138,9 @@ class AgentTracer:
         return {"role": str(m.get("role", "")), "content": self._trim_text(str(m.get("content", ""))) or ""}
 
 
-# ---------------------------
-# Strict validation: keys must be exactly attributes
-# ---------------------------
-
 class StrictAttributesResult(RootModel[dict[str, str | None]]):
     """
-    RootModel позволяет ключи словаря любыми строками (русские/цифры/что угодно).
-    Проверку ключей делаем сами в model_validator.  [oai_citation:2‡docs.pydantic.dev](https://docs.pydantic.dev/latest/concepts/validators/?utm_source=chatgpt.com)
+    RootModel позволяет ключи любыми строками (русский/цифры/что угодно).
     """
     _allowed_keys: tuple[str, ...] = ()
 
@@ -140,7 +157,6 @@ class StrictAttributesResult(RootModel[dict[str, str | None]]):
         if missing:
             raise ValueError(f"Отсутствующие ключи: {sorted(missing)}")
 
-        # типы: str|null; если модель дала число/булево — приводим к str
         for k, v in list(data.items()):
             if v is None:
                 continue
@@ -151,24 +167,17 @@ class StrictAttributesResult(RootModel[dict[str, str | None]]):
 
     @classmethod
     def for_attributes(cls, attributes: list[str]) -> type["StrictAttributesResult"]:
-        # создаём подкласс с заданным allowed list
-        attrs = tuple(attributes)
-        return type("StrictAttributesResultForTask", (cls,), {"_allowed_keys": attrs})
+        return type("StrictAttributesResultForTask", (cls,), {"_allowed_keys": tuple(attributes)})
 
-
-# ---------------------------
-# Tool schema factory (NO attribute modifications)
-# ---------------------------
 
 class ToolSchemaFactory:
     """
-    Генерируем tools schema вручную:
-    - properties: ключи = атрибуты КАК ЕСТЬ
-    - required: все атрибуты (ключи должны присутствовать, даже если null)
-    - additionalProperties: false
-    Это и есть включение tool calling: параметр tools + tool_choice.  [oai_citation:3‡platform.openai.com](https://platform.openai.com/docs/guides/function-calling?utm_source=chatgpt.com)
+    tools schema генерим вручную:
+    - properties ключи = атрибуты как есть (ничего не модифицируем)
+    - required = все атрибуты
+    - additionalProperties=false
+    Это и включает tool calling вместе с tool_choice.  [oai_citation:2‡docs.litellm.ai](https://docs.litellm.ai/docs/proxy/user_keys?utm_source=chatgpt.com)
     """
-
     def __init__(self, tool_name: str = "extract_insurance_attributes") -> None:
         self._tool_name = tool_name
 
@@ -198,16 +207,12 @@ class ToolSchemaFactory:
         return [tool], tool_choice
 
 
-# ---------------------------
-# Agent
-# ---------------------------
-
 class InsuranceAttributeExtractionAgent:
     def __init__(self, config: AgentConfig) -> None:
         self._cfg = config
         self._client = self._build_openai_client()
+        self._tools_factory = ToolSchemaFactory()
         self._tracer = AgentTracer(config.trace_enabled, config.trace_print, config.trace_max_chars)
-        self._tool_factory = ToolSchemaFactory()
 
     def extract(
         self,
@@ -216,30 +221,82 @@ class InsuranceAttributeExtractionAgent:
     ) -> tuple[dict[str, str | None] | None, TokenUsageSummary, list[TraceEvent]]:
         usage_sum = TokenUsageSummary()
 
-        tools, tool_choice = self._tool_factory.build(attributes)
+        tools, tool_choice = self._tools_factory.build(attributes)
         ValidatorModel = StrictAttributesResult.for_attributes(attributes)
 
-        # 1) Основной запрос (с жирным документом)
+        # 1) Основной запрос с документом
         messages = [
-            {"role": "system", "content": self._system_prompt()},
+            {"role": "system", "content": self._system_prompt_extract()},
             {"role": "user", "content": self._user_payload(markdown_text, attributes)},
         ]
 
         calls_left = int(self._cfg.max_total_calls)
         fix_left = int(self._cfg.max_fix_calls)
 
-        last_assistant_content: str | None = None
-        last_tool_args_raw: str | None = None
+        last_tool_args_or_text = ""
 
         while calls_left > 0:
             calls_left -= 1
 
             purpose = "extract" if fix_left == self._cfg.max_fix_calls else "fix"
-            trace_id = self._tracer.start(purpose, messages, tools, tool_choice)
 
             try:
-                # >>> ВОТ ТУТ включён tool calling:
-                #     tools=... и tool_choice=... в chat.completions.create  [oai_citation:4‡platform.openai.com](https://platform.openai.com/docs/guides/function-calling?utm_source=chatgpt.com)
+                result, last_tool_args_or_text = self._call_with_connection_retry(
+                    purpose=purpose,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    validator_model=ValidatorModel,
+                    usage_sum=usage_sum,
+                )
+                return result, usage_sum, self._tracer.events()
+
+            except _ConnectionFinalError as e:
+                # Повторяли по сети, но не вышло — останавливаем пайплайн.
+                return None, usage_sum, self._tracer.events()
+
+            except Exception as e:
+                # Любая валидация/протокол/JSON ошибка -> пробуем "тонкий fix" без документа
+                if fix_left > 0 and calls_left > 0:
+                    fix_left -= 1
+                    messages = self._minimal_fix_messages(
+                        attributes=attributes,
+                        error=str(e),
+                        last_tool_args_or_text=last_tool_args_or_text,
+                    )
+                    continue
+                return None, usage_sum, self._tracer.events()
+
+        return None, usage_sum, self._tracer.events()
+
+    def _call_with_connection_retry(
+        self,
+        purpose: str,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: dict,
+        validator_model: type[StrictAttributesResult],
+        usage_sum: TokenUsageSummary,
+    ) -> tuple[dict[str, str | None], str]:
+        """
+        Один "логический" вызов, внутри которого:
+        - connection retries (APIConnectionError/APITimeoutError)  [oai_citation:3‡OpenAI платформы](https://platform.openai.com/docs/guides/error-codes?utm_source=chatgpt.com)
+        - трассируем каждую попытку отдельно
+        """
+        last_tool_args_or_text = ""
+
+        for attempt_no in range(1, int(self._cfg.connection_retries) + 2):
+            trace_id = self._tracer.start(
+                purpose=purpose,
+                attempt_no=attempt_no,
+                messages=messages,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+
+            usage_sum.attempts += 1
+
+            try:
                 resp = self._client.chat.completions.create(
                     model=self._cfg.model,
                     messages=messages,
@@ -250,56 +307,76 @@ class InsuranceAttributeExtractionAgent:
                 )
 
                 usage = self._extract_usage(resp)
-                self._accumulate_usage(usage_sum, usage)
+                if usage:
+                    usage_sum.responses_received += 1
+                    usage_sum.input_tokens += usage["input_tokens"]
+                    usage_sum.output_tokens += usage["output_tokens"]
+                    usage_sum.total_tokens += usage["total_tokens"]
 
                 msg = resp.choices[0].message
-                last_assistant_content = getattr(msg, "content", None)
+                assistant_content = getattr(msg, "content", None)
 
                 tool_args_raw = self._extract_tool_arguments(msg)
-                last_tool_args_raw = tool_args_raw
-
                 if tool_args_raw is None:
+                    last_tool_args_or_text = assistant_content or ""
+                    self._tracer.finish(
+                        trace_id,
+                        assistant_content=assistant_content,
+                        tool_arguments_raw=None,
+                        parsed_result=None,
+                        usage=usage,
+                        error_kind="protocol",
+                        error="Модель не вернула tool_calls.function.arguments",
+                    )
                     raise ValueError("Модель не вернула tool_calls.function.arguments")
 
+                last_tool_args_or_text = tool_args_raw
+
                 data = json.loads(tool_args_raw)
-                validated = ValidatorModel.model_validate(data)
+                validated = validator_model.model_validate(data)
                 result = dict(validated.root)
 
                 self._tracer.finish(
                     trace_id,
-                    assistant_content=last_assistant_content,
+                    assistant_content=assistant_content,
                     tool_arguments_raw=tool_args_raw,
                     parsed_result=result,
                     usage=usage,
+                    error_kind=None,
                     error=None,
                 )
-                return result, usage_sum, self._tracer.events()
+                return result, last_tool_args_or_text
 
-            except Exception as e:
-                usage = None
-                # usage можем не получить, если ошибка случилась до resp/usage
+            except (APIConnectionError, APITimeoutError) as e:
+                # connection error -> логируем и повторяем
                 self._tracer.finish(
                     trace_id,
-                    assistant_content=last_assistant_content,
-                    tool_arguments_raw=last_tool_args_raw,
+                    assistant_content=None,
+                    tool_arguments_raw=None,
                     parsed_result=None,
-                    usage=usage,
+                    usage=None,
+                    error_kind="connection",
                     error=str(e),
                 )
-
-                # Если это первый провал — делаем "экономичный fix" без документа:
-                if fix_left > 0 and calls_left > 0:
-                    fix_left -= 1
-                    messages = self._minimal_fix_messages(
-                        attributes=attributes,
-                        error=str(e),
-                        last_tool_args_or_text=last_tool_args_raw or last_assistant_content or "",
-                    )
+                if attempt_no <= int(self._cfg.connection_retries):
+                    time.sleep(float(self._cfg.connection_retry_sleep_seconds))
                     continue
+                raise _ConnectionFinalError(str(e)) from e
 
-                break
+            except Exception as e:
+                # любая другая ошибка (JSON/валидация/и т.д.)
+                self._tracer.finish(
+                    trace_id,
+                    assistant_content=None,
+                    tool_arguments_raw=last_tool_args_or_text or None,
+                    parsed_result=None,
+                    usage=None,
+                    error_kind="validation",
+                    error=str(e),
+                )
+                raise
 
-        return None, usage_sum, self._tracer.events()
+        raise _ConnectionFinalError("Unexpected retry loop exit")
 
     def _build_openai_client(self) -> OpenAI:
         headers = {}
@@ -309,14 +386,20 @@ class InsuranceAttributeExtractionAgent:
         else:
             api_key = self._cfg.litellm_api_key
 
+        # ВНИМАНИЕ: verify=False отключает проверку TLS сертификата (опасно в проде).
+        # Вы это просили явно.
+        http_client = DefaultHttpxClient(verify=False)  #  [oai_citation:4‡Hugging Face](https://huggingface.co/koichi12/llm_tutorial/blob/04079614d32612f7824868db5cc8dfadd69fae63/.venv/lib/python3.11/site-packages/openai/_base_client.py?utm_source=chatgpt.com)
+
         return OpenAI(
             base_url=self._cfg.litellm_base_url,
             api_key=api_key,
             default_headers=headers or None,
+            http_client=http_client,
+            max_retries=0,  # чтобы retries были только нашими
         )
 
     @staticmethod
-    def _system_prompt() -> str:
+    def _system_prompt_extract() -> str:
         return (
             "Ты извлекаешь значения атрибутов из текста страхового продукта.\n"
             "Всегда вызывай инструмент и возвращай аргументы инструмента.\n"
@@ -339,8 +422,8 @@ class InsuranceAttributeExtractionAgent:
     @staticmethod
     def _minimal_fix_messages(attributes: list[str], error: str, last_tool_args_or_text: str) -> list[dict]:
         """
-        Экономия токенов: НЕ отправляем исходный markdown.
-        Просим только пересобрать/исправить результат по списку атрибутов.
+        Экономия токенов: не шлём исходный markdown.
+        Исправляем только структуру предыдущего результата.
         """
         attrs = "\n".join(f"- {a}" for a in attributes)
         return [
@@ -349,14 +432,15 @@ class InsuranceAttributeExtractionAgent:
                 "content": (
                     "Ты исправляешь результат, чтобы он строго соответствовал списку атрибутов.\n"
                     "Всегда вызывай инструмент и возвращай аргументы инструмента.\n"
-                    "НЕ выдумывай новые значения. Только нормализуй структуру.\n"
+                    "НЕ выдумывай новые значения.\n"
+                    "Если значения неизвестны — ставь null.\n"
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Ошибка валидации: {error}\n\n"
-                    f"Список атрибутов (ключи):\n{attrs}\n\n"
+                    f"Ошибка: {error}\n\n"
+                    f"Список атрибутов:\n{attrs}\n\n"
                     "Вот предыдущий результат (его надо исправить):\n"
                     "-----\n"
                     f"{last_tool_args_or_text}\n"
@@ -397,14 +481,9 @@ class InsuranceAttributeExtractionAgent:
 
         return {"input_tokens": int(inp), "output_tokens": int(out), "total_tokens": int(total)}
 
-    @staticmethod
-    def _accumulate_usage(total: TokenUsageSummary, usage: dict[str, int] | None) -> None:
-        total.calls += 1
-        if not usage:
-            return
-        total.input_tokens += usage["input_tokens"]
-        total.output_tokens += usage["output_tokens"]
-        total.total_tokens += usage["total_tokens"]
+
+class _ConnectionFinalError(RuntimeError):
+    pass
 
 
 if __name__ == "__main__":
@@ -433,11 +512,12 @@ if __name__ == "__main__":
     print("RESULT:", result)
     print("USAGE:", usage.model_dump())
 
+    # Отладка: все обращения к модели (включая retries)
     print("\nTRACE EVENTS:", len(trace))
     for ev in trace:
-        print(f"\n--- CALL #{ev.index} purpose={ev.purpose} ---")
-        print("tools_count:", ev.tools_count, "tool_choice:", ev.tool_choice)
-        print("usage:", ev.usage)
+        print(f"\n--- CALL #{ev.index} purpose={ev.purpose} attempt={ev.attempt_no} ---")
+        print("error_kind:", ev.error_kind)
         print("error:", ev.error)
+        print("usage:", ev.usage)
         if ev.tool_arguments_raw:
             print("tool_arguments_raw:", ev.tool_arguments_raw[:300], "..." if len(ev.tool_arguments_raw) > 300 else "")
