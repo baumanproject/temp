@@ -10,11 +10,9 @@ from pydantic import BaseModel, RootModel, model_validator
 
 
 class AgentConfig(BaseModel):
-    # LiteLLM Proxy (OpenAI-compatible)
     litellm_base_url: str = "http://localhost:4000"
     litellm_api_key: str = "CHANGE_ME"
 
-    # optional virtual key header
     litellm_virtual_key: str | None = None
     litellm_virtual_key_header: str = "X-Litellm-Key"
 
@@ -22,28 +20,27 @@ class AgentConfig(BaseModel):
     temperature: float = 0.0
     max_output_tokens: int = 1200
 
-    # MODE: "JSON" или "TOOLS"
-    mode: str = "JSON"  # "JSON" | "TOOLS"
+    # "JSON" | "TOOLS"
+    mode: str = "JSON"
 
-    # логические вызовы (extract + fix)
+    # Optional: в JSON-режиме можно форсить валидный JSON (если поддерживается)
+    # OpenAI Chat Completions: response_format={"type":"json_object"}  [oai_citation:2‡OpenAI Platform](https://platform.openai.com/docs/api-reference/chat?utm_source=chatgpt.com)
+    json_force_response_format: bool = False
+
     max_total_calls: int = 3
     max_fix_calls: int = 1
 
-    # network retry (только для connection/timeout)
     connection_retries: int = 1
     connection_retry_sleep_seconds: float = 0.5
 
-    # логирование/трассировка
     trace_enabled: bool = True
     trace_print: bool = False
-    trace_max_chars: int = 4000
+    trace_max_chars: int = 6000
 
 
 class TokenUsageSummary(BaseModel):
-    # все попытки (включая connection retries)
     attempts: int = 0
     responses_received: int = 0
-
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
@@ -52,25 +49,25 @@ class TokenUsageSummary(BaseModel):
 class TraceEvent(BaseModel):
     index: int
     mode: str
-    purpose: str         # "extract" | "fix"
-    attempt_no: int      # номер сетевой попытки
+    purpose: str
+    attempt_no: int
 
     messages: list[dict[str, str]]
 
-    # TOOLS mode
+    # TOOLS
     tools_count: int = 0
     tool_choice: dict | None = None
     tool_name: str | None = None
     tool_call_id: str | None = None
     tool_arguments_raw: str | None = None
 
-    # JSON mode
+    # JSON
     assistant_content: str | None = None
 
     parsed_result: dict[str, str | None] | None = None
     usage: dict[str, int] | None = None
 
-    error_kind: str | None = None   # "connection" | "validation" | "protocol" | "unknown"
+    error_kind: str | None = None
     error: str | None = None
 
 
@@ -85,15 +82,7 @@ class AgentTracer:
     def events(self) -> list[TraceEvent]:
         return list(self._events)
 
-    def start(
-        self,
-        mode: str,
-        purpose: str,
-        attempt_no: int,
-        messages: list[dict],
-        tools: list[dict] | None,
-        tool_choice: dict | None,
-    ) -> int:
+    def start(self, mode: str, purpose: str, attempt_no: int, messages: list[dict], tools: list[dict] | None, tool_choice: dict | None) -> int:
         if not self._enabled:
             return -1
         self._i += 1
@@ -115,10 +104,10 @@ class AgentTracer:
         self,
         trace_id: int,
         *,
+        assistant_content: str | None = None,
         tool_name: str | None = None,
         tool_call_id: str | None = None,
         tool_arguments_raw: str | None = None,
-        assistant_content: str | None = None,
         parsed_result: dict[str, str | None] | None = None,
         usage: dict[str, int] | None = None,
         error_kind: str | None = None,
@@ -130,10 +119,10 @@ class AgentTracer:
         if not ev:
             return
 
+        ev.assistant_content = self._trim_text(assistant_content)
         ev.tool_name = tool_name
         ev.tool_call_id = tool_call_id
         ev.tool_arguments_raw = self._trim_text(tool_arguments_raw)
-        ev.assistant_content = self._trim_text(assistant_content)
         ev.parsed_result = parsed_result
         ev.usage = usage
         ev.error_kind = error_kind
@@ -152,16 +141,10 @@ class AgentTracer:
         return s[: self._max_chars] + "…(truncated)"
 
     def _trim_msg(self, m: dict) -> dict[str, str]:
-        return {
-            "role": str(m.get("role", "")),
-            "content": self._trim_text(str(m.get("content", ""))) or "",
-        }
+        return {"role": str(m.get("role", "")), "content": self._trim_text(str(m.get("content", ""))) or ""}
 
 
 class StrictAttributesResult(RootModel[dict[str, str | None]]):
-    """
-    RootModel позволяет ключи любыми строками (русские/цифры/что угодно).  [oai_citation:5‡docs.pydantic.dev](https://docs.pydantic.dev/latest/api/root_model/?utm_source=chatgpt.com)
-    """
     _allowed_keys: tuple[str, ...] = ()
 
     @model_validator(mode="after")
@@ -177,7 +160,6 @@ class StrictAttributesResult(RootModel[dict[str, str | None]]):
         if missing:
             raise ValueError(f"Отсутствующие ключи: {sorted(missing)}")
 
-        # Значения — str|null (если прилетело число/булево — приводим к строке)
         for k, v in list(data.items()):
             if v is None:
                 continue
@@ -192,22 +174,13 @@ class StrictAttributesResult(RootModel[dict[str, str | None]]):
 
 
 class ToolSchemaFactory:
-    """
-    В TOOLS режиме schema строим так, чтобы:
-    - properties ключи = атрибуты как есть
-    - required = все атрибуты
-    - additionalProperties=false
-    """
     def __init__(self, tool_name: str = "extract_insurance_attributes") -> None:
         self._tool_name = tool_name
 
     def build(self, attributes: list[str]) -> tuple[list[dict], dict]:
         props: dict[str, dict] = {}
         for a in attributes:
-            props[a] = {
-                "description": f"Значение атрибута '{a}' из текста. Если не найдено — null.",
-                "anyOf": [{"type": "string"}, {"type": "null"}],
-            }
+            props[a] = {"anyOf": [{"type": "string"}, {"type": "null"}]}
 
         tool = {
             "type": "function",
@@ -222,9 +195,14 @@ class ToolSchemaFactory:
                 },
             },
         }
-
         tool_choice = {"type": "function", "function": {"name": self._tool_name}}
         return [tool], tool_choice
+
+
+class StageError(RuntimeError):
+    def __init__(self, message: str, last_payload: str) -> None:
+        super().__init__(message)
+        self.last_payload = last_payload
 
 
 class InsuranceAttributeExtractionAgent:
@@ -235,21 +213,15 @@ class InsuranceAttributeExtractionAgent:
         self._tracer = AgentTracer(config.trace_enabled, config.trace_print, config.trace_max_chars)
         self._tool_factory = ToolSchemaFactory()
 
-    def extract(
-        self,
-        markdown_text: str,
-        attributes: list[str],
-    ) -> tuple[dict[str, str | None] | None, TokenUsageSummary, list[TraceEvent]]:
+    def extract(self, markdown_text: str, attributes: list[str]) -> tuple[dict[str, str | None] | None, TokenUsageSummary, list[TraceEvent]]:
         usage_sum = TokenUsageSummary()
         validator_model = StrictAttributesResult.for_attributes(attributes)
 
-        # prepare tools (only for TOOLS mode)
-        tools: list[dict] | None = None
-        tool_choice: dict | None = None
+        tools = None
+        tool_choice = None
         if self._mode == "TOOLS":
             tools, tool_choice = self._tool_factory.build(attributes)
 
-        # main messages
         messages = [
             {"role": "system", "content": self._system_prompt_extract(self._mode)},
             {"role": "user", "content": self._user_payload(markdown_text, attributes, self._mode)},
@@ -258,7 +230,6 @@ class InsuranceAttributeExtractionAgent:
         calls_left = int(self._cfg.max_total_calls)
         fix_left = int(self._cfg.max_fix_calls)
 
-        # Для “fix без документа” сохраняем последний “ответ модели”
         last_payload = ""
 
         while calls_left > 0:
@@ -268,7 +239,6 @@ class InsuranceAttributeExtractionAgent:
             try:
                 result, last_payload = self._call_stage(
                     purpose=purpose,
-                    mode=self._mode,
                     messages=messages,
                     tools=tools,
                     tool_choice=tool_choice,
@@ -277,8 +247,10 @@ class InsuranceAttributeExtractionAgent:
                 )
                 return result, usage_sum, self._tracer.events()
 
-            except Exception as e:
-                # Любая ошибка валидации/протокола/JSON -> делаем fix без документа
+            except StageError as e:
+                # ВАЖНО: last_payload берём прямо из исключения (он всегда заполнен, если был ответ модели)
+                last_payload = e.last_payload
+
                 if fix_left > 0 and calls_left > 0:
                     fix_left -= 1
                     messages = self._minimal_fix_messages(
@@ -288,6 +260,7 @@ class InsuranceAttributeExtractionAgent:
                         last_payload=last_payload,
                     )
                     continue
+
                 return None, usage_sum, self._tracer.events()
 
         return None, usage_sum, self._tracer.events()
@@ -296,28 +269,16 @@ class InsuranceAttributeExtractionAgent:
         self,
         *,
         purpose: str,
-        mode: str,
         messages: list[dict],
         tools: list[dict] | None,
         tool_choice: dict | None,
         validator_model: type[StrictAttributesResult],
         usage_sum: TokenUsageSummary,
     ) -> tuple[dict[str, str | None], str]:
-        """
-        Один stage (extract/fix) с connection retry.
-        Возвращает: (validated_result, last_payload_for_fix)
-        """
         last_payload = ""
 
         for attempt_no in range(1, int(self._cfg.connection_retries) + 2):
-            trace_id = self._tracer.start(
-                mode=mode,
-                purpose=purpose,
-                attempt_no=attempt_no,
-                messages=messages,
-                tools=tools,
-                tool_choice=tool_choice,
-            )
+            trace_id = self._tracer.start(self._mode, purpose, attempt_no, messages, tools, tool_choice)
             usage_sum.attempts += 1
 
             try:
@@ -327,7 +288,12 @@ class InsuranceAttributeExtractionAgent:
                     "temperature": self._cfg.temperature,
                     "max_tokens": self._cfg.max_output_tokens,
                 }
-                if mode == "TOOLS":
+
+                # JSON-mode enforcement (если включено и поддерживается прокси/модель)
+                if self._mode == "JSON" and self._cfg.json_force_response_format:
+                    kwargs["response_format"] = {"type": "json_object"}  #  [oai_citation:3‡OpenAI Platform](https://platform.openai.com/docs/api-reference/chat?utm_source=chatgpt.com)
+
+                if self._mode == "TOOLS":
                     kwargs["tools"] = tools or []
                     kwargs["tool_choice"] = tool_choice
 
@@ -342,32 +308,46 @@ class InsuranceAttributeExtractionAgent:
 
                 msg = resp.choices[0].message
 
-                if mode == "TOOLS":
+                if self._mode == "TOOLS":
                     tool_name, tool_call_id, tool_args_raw = self._extract_tool_call_info(msg)
                     if tool_args_raw is None:
                         last_payload = (getattr(msg, "content", None) or "")
                         self._tracer.finish(
                             trace_id,
+                            assistant_content=getattr(msg, "content", None),
                             tool_name=tool_name,
                             tool_call_id=tool_call_id,
-                            assistant_content=getattr(msg, "content", None),
                             usage=usage,
                             error_kind="protocol",
-                            error="Модель не вернула tool_calls.function.arguments",
+                            error="TOOLS: нет tool_calls.function.arguments",
                         )
-                        raise ValueError("TOOLS: нет tool_calls.function.arguments")
+                        raise StageError("TOOLS: нет tool_calls.function.arguments", last_payload)
 
-                    last_payload = tool_args_raw
-                    data = json.loads(tool_args_raw)
-                    validated = validator_model.model_validate(data)
-                    result = dict(validated.root)
+                    last_payload = tool_args_raw  # <-- сохраняем ДО парсинга
+
+                    try:
+                        data = json.loads(tool_args_raw)
+                        validated = validator_model.model_validate(data)
+                        result = dict(validated.root)
+                    except Exception as e:
+                        self._tracer.finish(
+                            trace_id,
+                            assistant_content=getattr(msg, "content", None),
+                            tool_name=tool_name,
+                            tool_call_id=tool_call_id,
+                            tool_arguments_raw=tool_args_raw,
+                            usage=usage,
+                            error_kind="validation",
+                            error=str(e),
+                        )
+                        raise StageError(f"TOOLS: parse/validate error: {e}", last_payload)
 
                     self._tracer.finish(
                         trace_id,
+                        assistant_content=getattr(msg, "content", None),
                         tool_name=tool_name,
                         tool_call_id=tool_call_id,
                         tool_arguments_raw=tool_args_raw,
-                        assistant_content=getattr(msg, "content", None),
                         parsed_result=result,
                         usage=usage,
                         error_kind=None,
@@ -386,12 +366,23 @@ class InsuranceAttributeExtractionAgent:
                         error_kind="protocol",
                         error="JSON: пустой message.content",
                     )
-                    raise ValueError("JSON: пустой message.content")
+                    raise StageError("JSON: пустой message.content", last_payload)
 
-                last_payload = assistant_content
-                data = self._parse_json_object(assistant_content)
-                validated = validator_model.model_validate(data)
-                result = dict(validated.root)
+                last_payload = assistant_content  # <-- сохраняем ДО парсинга
+
+                try:
+                    data = self._parse_json_object(assistant_content)
+                    validated = validator_model.model_validate(data)
+                    result = dict(validated.root)
+                except Exception as e:
+                    self._tracer.finish(
+                        trace_id,
+                        assistant_content=assistant_content,
+                        usage=usage,
+                        error_kind="validation",
+                        error=str(e),
+                    )
+                    raise StageError(f"JSON: parse/validate error: {e}", last_payload)
 
                 self._tracer.finish(
                     trace_id,
@@ -404,7 +395,6 @@ class InsuranceAttributeExtractionAgent:
                 return result, last_payload
 
             except (APIConnectionError, APITimeoutError) as e:
-                # connection/timeout -> логируем как отдельный TraceEvent и ретраим  [oai_citation:6‡OpenAI платформы](https://platform.openai.com/docs/guides/error-codes?utm_source=chatgpt.com)
                 self._tracer.finish(
                     trace_id,
                     error_kind="connection",
@@ -413,18 +403,9 @@ class InsuranceAttributeExtractionAgent:
                 if attempt_no <= int(self._cfg.connection_retries):
                     time.sleep(float(self._cfg.connection_retry_sleep_seconds))
                     continue
-                raise
+                raise StageError(f"Connection error: {e}", last_payload)
 
-            except Exception as e:
-                # любая другая ошибка
-                self._tracer.finish(
-                    trace_id,
-                    error_kind="validation",
-                    error=str(e),
-                )
-                raise
-
-        raise RuntimeError("Unexpected retry loop exit")
+        raise StageError("Unexpected retry loop exit", last_payload)
 
     def _build_openai_client(self) -> OpenAI:
         headers = {}
@@ -434,44 +415,37 @@ class InsuranceAttributeExtractionAgent:
         else:
             api_key = self._cfg.litellm_api_key
 
-        # Вы просили verify=False. OpenAI SDK позволяет передать http_client.  [oai_citation:7‡TIL](https://til.simonwillison.net/httpx/openai-log-requests-responses?utm_source=chatgpt.com)
         http_client = DefaultHttpxClient(verify=False)
-
         return OpenAI(
             base_url=self._cfg.litellm_base_url,
             api_key=api_key,
             default_headers=headers or None,
             http_client=http_client,
-            max_retries=0,  # чтобы ретраи были только нашими (и логировались)
+            max_retries=0,
         )
 
     @staticmethod
     def _system_prompt_extract(mode: str) -> str:
         if mode == "TOOLS":
-            # В TOOLS режиме модель должна вернуть tool call  [oai_citation:8‡OpenAI платформы](https://platform.openai.com/docs/guides/function-calling?utm_source=chatgpt.com)
             return (
                 "Ты извлекаешь значения атрибутов из текста страхового продукта.\n"
                 "Всегда вызывай инструмент и возвращай аргументы инструмента.\n"
                 "Значения бери только из входного текста. Если не найдено — null.\n"
                 "Никаких пояснений.\n"
             )
-
-        # JSON mode
         return (
             "Ты извлекаешь значения атрибутов из текста страхового продукта.\n"
-            "Верни ТОЛЬКО JSON-объект.\n"
-            "Ключи — строго как в списке атрибутов.\n"
+            "Верни ТОЛЬКО валидный JSON-объект.\n"
+            "Ключи всегда в ДВОЙНЫХ кавычках.\n"
             "Значения — строки или null.\n"
             "Никаких пояснений, никакого markdown, никаких ```.\n"
-            "Значения бери только из входного текста. Если не найдено — null.\n"
         )
 
     @staticmethod
     def _user_payload(markdown_text: str, attributes: list[str], mode: str) -> str:
-        attrs = "\n".join(f"- {a}" for a in attributes)
+        attrs_json = json.dumps(attributes, ensure_ascii=False)
         return (
-            "Список атрибутов (ключи результата должны совпадать с ними ТОЧНО):\n"
-            f"{attrs}\n\n"
+            "attributes_json = " + attrs_json + "\n\n"
             "Текст (markdown, включая таблицы):\n"
             "-----\n"
             f"{markdown_text}\n"
@@ -481,47 +455,40 @@ class InsuranceAttributeExtractionAgent:
 
     @staticmethod
     def _minimal_fix_messages(mode: str, attributes: list[str], error: str, last_payload: str) -> list[dict]:
-        """
-        Экономия токенов: НЕ шлём исходный markdown документ.
-        Шлём только последний ответ модели и требуем привести его к валидному формату.
-        """
-        attrs = "\n".join(f"- {a}" for a in attributes)
+        # Ключевое: передаём атрибуты как JSON array и даём валидный JSON template.
+        attrs_json = json.dumps(attributes, ensure_ascii=False)
+        template_json = json.dumps({a: None for a in attributes}, ensure_ascii=False, indent=2)
 
         if mode == "TOOLS":
             sys = (
-                "Ты исправляешь результат, чтобы он строго соответствовал списку атрибутов.\n"
+                "Ты исправляешь РЕЗУЛЬТАТ.\n"
                 "Всегда вызывай инструмент и возвращай аргументы инструмента.\n"
-                "НЕ выдумывай новые значения.\n"
-                "Если неизвестно — null.\n"
+                "НЕ выдумывай новые значения, только исправь структуру.\n"
+                "Ключи должны быть строго как в attributes_json.\n"
                 "Никаких пояснений.\n"
             )
-            usr = (
-                f"Ошибка: {error}\n\n"
-                f"Список атрибутов:\n{attrs}\n\n"
-                "Вот предыдущий результат (его надо исправить):\n"
-                "-----\n"
-                f"{last_payload}\n"
-                "-----\n"
+        else:
+            sys = (
+                "Ты исправляешь JSON-ответ.\n"
+                "Верни ТОЛЬКО валидный JSON-объект.\n"
+                "Ключи всегда в ДВОЙНЫХ кавычках.\n"
+                "Ключи строго как в attributes_json.\n"
+                "Лишние ключи запрещены.\n"
+                "Никаких ``` и markdown.\n"
             )
-            return [{"role": "system", "content": sys}, {"role": "user", "content": usr}]
 
-        # JSON mode
-        sys = (
-            "Ты исправляешь JSON-ответ.\n"
-            "Верни ТОЛЬКО валидный JSON-объект.\n"
-            "Ключи — строго как в списке атрибутов.\n"
-            "Значения — строки или null.\n"
-            "Никаких ``` и markdown.\n"
-            "Никаких пояснений.\n"
-        )
         usr = (
-            f"Ошибка валидации: {error}\n\n"
-            f"Список атрибутов:\n{attrs}\n\n"
-            "Вот предыдущий ответ (его надо исправить):\n"
+            f"Ошибка: {error}\n\n"
+            f"attributes_json = {attrs_json}\n\n"
+            "template_json (пример структуры, ключи уже в кавычках):\n"
+            f"{template_json}\n\n"
+            "Вот предыдущий ответ модели (исправь ЕГО):\n"
             "-----\n"
-            f"{last_payload}\n"
+            f"{last_payload if last_payload else '[EMPTY_LAST_PAYLOAD]'}\n"
             "-----\n"
+            "Важно: это должен быть ВАЛИДНЫЙ JSON (ключи в двойных кавычках).\n"
         )
+
         return [{"role": "system", "content": sys}, {"role": "user", "content": usr}]
 
     @staticmethod
@@ -565,13 +532,9 @@ class InsuranceAttributeExtractionAgent:
 
     @staticmethod
     def _parse_json_object(text: str) -> dict:
-        """
-        Строго: ожидаем JSON-объект. Если модель добавила ```json ... ``` — убираем.
-        Если парсинг не прошёл — это будет триггер для fix-шага.
-        """
         t = text.strip()
 
-        # убираем ```json ... ```
+        # если модель завернула в ```json ... ```
         if t.startswith("```"):
             t = t.strip("`").strip()
             if t.lower().startswith("json"):
@@ -580,47 +543,24 @@ class InsuranceAttributeExtractionAgent:
         return json.loads(t)
 
 
-# ---------------------------
-# Примеры вызова
-# ---------------------------
-
+# --- Example usage ---
 if __name__ == "__main__":
-    md_text = """
-# Продукт “Супер-страхование”
-| Параметр | Значение |
-|---|---|
-| Страховая сумма | 1 000 000 ₽ |
-| Франшиза | 10 000 ₽ |
-| Территория | РФ |
-"""
-    attrs = ["Страховая сумма", "Франшиза", "Территория", "Срок страхования 2025"]
+    md_text = "# ... ваш markdown ..."
+    attrs = ["Страховая сумма", "Франшиза"]
 
-    # ---- MODE.JSON ----
+    # JSON mode
     cfg_json = AgentConfig(
         litellm_base_url=os.getenv("LITELLM_BASE_URL", "http://localhost:4000"),
         litellm_api_key=os.getenv("LITELLM_API_KEY", "CHANGE_ME"),
         model=os.getenv("LLM_MODEL", "gigachat"),
         mode="JSON",
-        trace_enabled=True,
-        trace_print=False,
+        json_force_response_format=False,  # включи True если прокси/модель поддерживает  [oai_citation:4‡OpenAI Platform](https://platform.openai.com/docs/api-reference/chat?utm_source=chatgpt.com)
+        trace_print=True,
     )
     agent_json = InsuranceAttributeExtractionAgent(cfg_json)
-    result_json, usage_json, trace_json = agent_json.extract(md_text, attrs)
-    print("\nJSON RESULT:", result_json)
-    print("JSON USAGE:", usage_json.model_dump())
-    print("JSON TRACE EVENTS:", len(trace_json))
+    r, u, t = agent_json.extract(md_text, attrs)
 
-    # ---- MODE.TOOLS ----
-    cfg_tools = AgentConfig(
-        litellm_base_url=os.getenv("LITELLM_BASE_URL", "http://localhost:4000"),
-        litellm_api_key=os.getenv("LITELLM_API_KEY", "CHANGE_ME"),
-        model=os.getenv("LLM_MODEL", "gigachat"),
-        mode="TOOLS",
-        trace_enabled=True,
-        trace_print=False,
-    )
+    # TOOLS mode
+    cfg_tools = cfg_json.model_copy(update={"mode": "TOOLS"})
     agent_tools = InsuranceAttributeExtractionAgent(cfg_tools)
-    result_tools, usage_tools, trace_tools = agent_tools.extract(md_text, attrs)
-    print("\nTOOLS RESULT:", result_tools)
-    print("TOOLS USAGE:", usage_tools.model_dump())
-    print("TOOLS TRACE EVENTS:", len(trace_tools))
+    r2, u2, t2 = agent_tools.extract(md_text, attrs)
