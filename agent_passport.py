@@ -1,20 +1,20 @@
-# insurance_attribute_agent_tools.py
-
+import json
 import os
-import re
+from dataclasses import dataclass
 
 from openai import OpenAI
+from pydantic import BaseModel, RootModel, model_validator
 
-import instructor
-from instructor.core.hooks import Hooks
-from pydantic import BaseModel, Field, ConfigDict, create_model
 
+# ---------------------------
+# Config
+# ---------------------------
 
 class AgentConfig(BaseModel):
     litellm_base_url: str = "http://localhost:4000"
     litellm_api_key: str = "CHANGE_ME"
 
-    # optional virtual key header for LiteLLM proxy
+    # Optional: Virtual key header for LiteLLM Proxy
     litellm_virtual_key: str | None = None
     litellm_virtual_key_header: str = "X-Litellm-Key"
 
@@ -22,133 +22,35 @@ class AgentConfig(BaseModel):
     temperature: float = 0.0
     max_output_tokens: int = 1200
 
-    # attempts
+    # Attempts
     max_total_calls: int = 3
-    max_format_fixes: int = 1
+    max_fix_calls: int = 1  # сколько раз пробуем "починить" без исходного документа
 
-    # tracing
-    trace_enabled: bool = True          # хранить трейс в памяти
-    trace_print: bool = False           # печатать в stdout
-    trace_max_chars: int = 4000         # обрезка длинных сообщений
-
-    format_fix_user_prompt_template: str = (
-        "Предыдущий ответ не прошёл валидацию.\n"
-        "Ошибка (для ориентира): {error}\n\n"
-        "Пересобери результат СТРОГО по списку атрибутов.\n"
-        "Правила:\n"
-        "1) Ключи — ТОЧНО как в списке атрибутов.\n"
-        "2) Значения — строки или null.\n"
-        "3) Запрещены лишние ключи.\n"
-        "4) Верни ТОЛЬКО результат, без пояснений.\n"
-    )
+    # Tracing
+    trace_enabled: bool = True
+    trace_print: bool = False
+    trace_max_chars: int = 4000
 
 
 class TokenUsageSummary(BaseModel):
-    calls_attempted: int = 0
-    responses_received: int = 0
+    calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
 
 
-class TokenLedger:
-    """
-    Hooks:
-      - completion:kwargs -> фиксируем факт попытки + можно смотреть tools/tool_choice
-      - completion:response -> usage + последний assistant text (часто это tool arguments)
-     [oai_citation:4‡python.useinstructor.com](https://python.useinstructor.com/concepts/hooks/?utm_source=chatgpt.com)
-    """
-    def __init__(self) -> None:
-        self._summary = TokenUsageSummary()
-        self._last_assistant_text: str | None = None
-        self._last_usage: dict[str, int] | None = None
-        self._last_kwargs: dict | None = None
-
-    def on_completion_kwargs(self, **kwargs) -> None:
-        self._summary.calls_attempted += 1
-        self._last_kwargs = kwargs
-
-    def on_completion_response(self, response) -> None:
-        self._summary.responses_received += 1
-        self._last_assistant_text = self._extract_assistant_text(response)
-        self._last_usage = self._extract_usage_dict(response)
-        self._accumulate(self._last_usage)
-
-    def summary(self) -> TokenUsageSummary:
-        return self._summary
-
-    def last_assistant_text(self) -> str | None:
-        return self._last_assistant_text
-
-    def last_usage(self) -> dict[str, int] | None:
-        return self._last_usage
-
-    def last_provider_kwargs(self) -> dict | None:
-        return self._last_kwargs
-
-    def _accumulate(self, usage: dict[str, int] | None) -> None:
-        if not usage:
-            return
-        self._summary.input_tokens += int(usage.get("input_tokens", 0))
-        self._summary.output_tokens += int(usage.get("output_tokens", 0))
-        self._summary.total_tokens += int(usage.get("total_tokens", 0))
-
-    @staticmethod
-    def _extract_usage_dict(response) -> dict[str, int] | None:
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            return None
-
-        def get(key: str) -> int | None:
-            if isinstance(usage, dict):
-                v = usage.get(key)
-                return int(v) if v is not None else None
-            v = getattr(usage, key, None)
-            return int(v) if v is not None else None
-
-        prompt = get("prompt_tokens") or get("input_tokens") or 0
-        comp = get("completion_tokens") or get("output_tokens") or 0
-        total = get("total_tokens")
-        if total is None:
-            total = int(prompt) + int(comp)
-
-        return {"input_tokens": int(prompt), "output_tokens": int(comp), "total_tokens": int(total)}
-
-    @staticmethod
-    def _extract_assistant_text(response) -> str | None:
-        """
-        В tool calling полезная нагрузка обычно в tool_calls[0].function.arguments.
-        Это удобно для "тонкого" fix без исходного документа.  [oai_citation:5‡platform.openai.com](https://platform.openai.com/docs/guides/function-calling?utm_source=chatgpt.com)
-        """
-        try:
-            msg = response.choices[0].message
-
-            tool_calls = getattr(msg, "tool_calls", None)
-            if tool_calls:
-                fn = getattr(tool_calls[0], "function", None)
-                if fn:
-                    args = getattr(fn, "arguments", None)
-                    if args:
-                        return str(args)
-
-            content = getattr(msg, "content", None)
-            if content:
-                return str(content)
-
-            refusal = getattr(msg, "refusal", None)
-            if refusal:
-                return str(refusal)
-        except Exception:
-            return None
-        return None
-
+# ---------------------------
+# Tracing
+# ---------------------------
 
 class TraceEvent(BaseModel):
     index: int
     purpose: str
-    request_messages: list[dict[str, str]]
-    provider_kwargs_compact: dict | None = None
-    assistant_text: str | None = None
+    messages: list[dict[str, str]]
+    tools_count: int
+    tool_choice: dict | None
+    assistant_content: str | None = None
+    tool_arguments_raw: str | None = None
     parsed_result: dict[str, str | None] | None = None
     usage: dict[str, int] | None = None
     error: str | None = None
@@ -160,261 +62,272 @@ class AgentTracer:
         self._do_print = do_print
         self._max_chars = int(max_chars)
         self._events: list[TraceEvent] = []
-        self._counter = 0
+        self._i = 0
 
     def events(self) -> list[TraceEvent]:
         return list(self._events)
 
-    def start_call(self, purpose: str, messages: list[dict]) -> int:
+    def start(self, purpose: str, messages: list[dict], tools: list[dict], tool_choice: dict | None) -> int:
         if not self._enabled:
             return -1
-        self._counter += 1
-        idx = self._counter
+        self._i += 1
         ev = TraceEvent(
-            index=idx,
+            index=self._i,
             purpose=purpose,
-            request_messages=[self._trim_msg(m) for m in messages],
+            messages=[self._trim_msg(m) for m in messages],
+            tools_count=len(tools),
+            tool_choice=tool_choice,
         )
         self._events.append(ev)
-
         if self._do_print:
-            print(f"\n[TRACE] CALL #{idx} purpose={purpose}")
-        return idx
+            print(f"\n[TRACE] CALL #{ev.index} purpose={purpose} tools={len(tools)} tool_choice={tool_choice}")
+        return ev.index
 
-    def finish_call(
+    def finish(
         self,
         trace_id: int,
-        assistant_text: str | None,
-        usage: dict[str, int] | None,
+        assistant_content: str | None,
+        tool_arguments_raw: str | None,
         parsed_result: dict[str, str | None] | None,
+        usage: dict[str, int] | None,
         error: str | None,
-        provider_kwargs: dict | None,
     ) -> None:
         if not self._enabled or trace_id < 0:
             return
-        ev = next((e for e in self._events if e.index == trace_id), None)
-        if ev is None:
+        ev = next((x for x in self._events if x.index == trace_id), None)
+        if not ev:
             return
-
-        ev.assistant_text = self._trim_text(assistant_text)
-        ev.usage = usage
+        ev.assistant_content = self._trim_text(assistant_content)
+        ev.tool_arguments_raw = self._trim_text(tool_arguments_raw)
         ev.parsed_result = parsed_result
+        ev.usage = usage
         ev.error = error
-        ev.provider_kwargs_compact = self._compact_kwargs(provider_kwargs)
-
         if self._do_print:
             print(f"[TRACE] RESULT #{trace_id} usage={usage} error={error}")
 
-    def _trim_text(self, text: str | None) -> str | None:
-        if text is None:
+    def _trim_text(self, s: str | None) -> str | None:
+        if s is None:
             return None
-        if len(text) <= self._max_chars:
-            return text
-        return text[: self._max_chars] + "…(truncated)"
+        if len(s) <= self._max_chars:
+            return s
+        return s[: self._max_chars] + "…(truncated)"
 
-    def _trim_msg(self, msg: dict) -> dict[str, str]:
-        return {
-            "role": str(msg.get("role", "")),
-            "content": self._trim_text(str(msg.get("content", ""))) or "",
+    def _trim_msg(self, m: dict) -> dict[str, str]:
+        return {"role": str(m.get("role", "")), "content": self._trim_text(str(m.get("content", ""))) or ""}
+
+
+# ---------------------------
+# Strict validation: keys must be exactly attributes
+# ---------------------------
+
+class StrictAttributesResult(RootModel[dict[str, str | None]]):
+    """
+    RootModel позволяет ключи словаря любыми строками (русские/цифры/что угодно).
+    Проверку ключей делаем сами в model_validator.  [oai_citation:2‡docs.pydantic.dev](https://docs.pydantic.dev/latest/concepts/validators/?utm_source=chatgpt.com)
+    """
+    _allowed_keys: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_keys_and_types(self):
+        data = self.root
+        allowed = set(self.__class__._allowed_keys)
+
+        extra = set(data.keys()) - allowed
+        if extra:
+            raise ValueError(f"Лишние ключи: {sorted(extra)}")
+
+        missing = allowed - set(data.keys())
+        if missing:
+            raise ValueError(f"Отсутствующие ключи: {sorted(missing)}")
+
+        # типы: str|null; если модель дала число/булево — приводим к str
+        for k, v in list(data.items()):
+            if v is None:
+                continue
+            if not isinstance(v, str):
+                data[k] = str(v)
+
+        return self
+
+    @classmethod
+    def for_attributes(cls, attributes: list[str]) -> type["StrictAttributesResult"]:
+        # создаём подкласс с заданным allowed list
+        attrs = tuple(attributes)
+        return type("StrictAttributesResultForTask", (cls,), {"_allowed_keys": attrs})
+
+
+# ---------------------------
+# Tool schema factory (NO attribute modifications)
+# ---------------------------
+
+class ToolSchemaFactory:
+    """
+    Генерируем tools schema вручную:
+    - properties: ключи = атрибуты КАК ЕСТЬ
+    - required: все атрибуты (ключи должны присутствовать, даже если null)
+    - additionalProperties: false
+    Это и есть включение tool calling: параметр tools + tool_choice.  [oai_citation:3‡platform.openai.com](https://platform.openai.com/docs/guides/function-calling?utm_source=chatgpt.com)
+    """
+
+    def __init__(self, tool_name: str = "extract_insurance_attributes") -> None:
+        self._tool_name = tool_name
+
+    def build(self, attributes: list[str]) -> tuple[list[dict], dict]:
+        properties: dict[str, dict] = {}
+        for a in attributes:
+            properties[a] = {
+                "description": f"Значение атрибута '{a}' из текста. Если не найдено — null.",
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+            }
+
+        tool = {
+            "type": "function",
+            "function": {
+                "name": self._tool_name,
+                "description": "Извлечь значения заданных атрибутов из описания страхового продукта.",
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": list(attributes),
+                    "additionalProperties": False,
+                },
+            },
         }
 
-    @staticmethod
-    def _compact_kwargs(kwargs: dict | None) -> dict | None:
-        """
-        Сюда хорошо смотреть при отладке:
-        completion:kwargs содержит tools/tool_choice после того, как Instructor
-        превратил response_model в tool schema.  [oai_citation:6‡python.useinstructor.com](https://python.useinstructor.com/concepts/hooks/?utm_source=chatgpt.com)
-        """
-        if not kwargs:
-            return None
-        compact = {}
-        for k in ("model", "temperature", "max_tokens", "tool_choice"):
-            if k in kwargs:
-                compact[k] = kwargs[k]
-        if "tools" in kwargs and isinstance(kwargs["tools"], list):
-            compact["tools"] = f"tools[{len(kwargs['tools'])}]"
-        return compact
+        tool_choice = {"type": "function", "function": {"name": self._tool_name}}
+        return [tool], tool_choice
 
 
-class AttributeModelFactory:
-    """
-    В TOOLS режиме нам нужно:
-    - явная схема (properties) под каждый атрибут
-    - ключи результата должны быть РОВНО атрибутами => используем alias=attr
-    - ключи обязаны присутствовать => Field(...), но значение может быть null
-    """
-    def __init__(self, attributes: list[str]) -> None:
-        seen: set[str] = set()
-        uniq: list[str] = []
-        for a in attributes:
-            if a not in seen:
-                uniq.append(a)
-                seen.add(a)
-        self._attributes = uniq
-
-    def build(self):
-        fields: dict[str, tuple[object, object]] = {}
-        used_names: set[str] = set()
-
-        for attr in self._attributes:
-            fname = self._safe_field_name(attr)
-            base = fname
-            i = 2
-            while fname in used_names:
-                fname = f"{base}_{i}"
-                i += 1
-            used_names.add(fname)
-
-            # КЛЮЧ ОБЯЗАН БЫТЬ (Field(...)), значение может быть null (str|None)
-            fields[fname] = (str | None, Field(..., alias=attr))
-
-        model_config = ConfigDict(extra="forbid", populate_by_name=True)
-        Dynamic = create_model("InsuranceAttributes", __config__=model_config, **fields)  # type: ignore
-
-        # Важно: schema должна быть с alias (русские ключи)
-        @classmethod
-        def _model_json_schema(cls, *args, **kwargs):
-            kwargs.setdefault("by_alias", True)
-            return super(Dynamic, cls).model_json_schema(*args, **kwargs)
-
-        Dynamic.model_json_schema = _model_json_schema  # type: ignore
-        return Dynamic
-
-    @staticmethod
-    def _safe_field_name(s: str) -> str:
-        # внутреннее python-имя; внешние ключи НЕ меняются (они alias)
-        s = re.sub(r"[^0-9a-zA-Z_]+", "_", s.strip())
-        if not s:
-            s = "field"
-        if re.match(r"^\d", s):
-            s = f"f_{s}"
-        return s
-
-
-class SystemPromptBuilder:
-    def build(self) -> str:
-        return (
-            "Ты — сервис извлечения данных из описаний страховых продуктов.\n"
-            "Нужно заполнить значения для всех атрибутов из списка.\n"
-            "Не выдумывай значения: только из текста. Если не найдено — null.\n"
-            "Таблицы markdown часто содержат пары key-value.\n"
-            "Верни только структурированный результат (без пояснений).\n"
-        )
-
+# ---------------------------
+# Agent
+# ---------------------------
 
 class InsuranceAttributeExtractionAgent:
     def __init__(self, config: AgentConfig) -> None:
-        self._config = config
-        self._ledger = TokenLedger()
+        self._cfg = config
+        self._client = self._build_openai_client()
         self._tracer = AgentTracer(config.trace_enabled, config.trace_print, config.trace_max_chars)
-        self._system_prompt = SystemPromptBuilder().build()
-
-        # (1) ВКЛЮЧАЕМ tool calling здесь:
-        # Instructor будет использовать tools/tool_choice механизм.  [oai_citation:7‡python.useinstructor.com](https://python.useinstructor.com/concepts/patching/?utm_source=chatgpt.com)
-        self._client = self._build_instructor_tools_client()
-
-        self._hooks = Hooks()
-        self._hooks.on("completion:kwargs", self._ledger.on_completion_kwargs)
-        self._hooks.on("completion:response", self._ledger.on_completion_response)
+        self._tool_factory = ToolSchemaFactory()
 
     def extract(
         self,
         markdown_text: str,
         attributes: list[str],
     ) -> tuple[dict[str, str | None] | None, TokenUsageSummary, list[TraceEvent]]:
-        response_model = AttributeModelFactory(attributes).build()
+        usage_sum = TokenUsageSummary()
 
+        tools, tool_choice = self._tool_factory.build(attributes)
+        ValidatorModel = StrictAttributesResult.for_attributes(attributes)
+
+        # 1) Основной запрос (с жирным документом)
         messages = [
-            {"role": "system", "content": self._system_prompt},
-            {"role": "user", "content": self._build_user_payload(markdown_text, attributes)},
+            {"role": "system", "content": self._system_prompt()},
+            {"role": "user", "content": self._user_payload(markdown_text, attributes)},
         ]
 
-        calls_left = int(self._config.max_total_calls)
-        fixes_left = int(self._config.max_format_fixes)
+        calls_left = int(self._cfg.max_total_calls)
+        fix_left = int(self._cfg.max_fix_calls)
+
+        last_assistant_content: str | None = None
+        last_tool_args_raw: str | None = None
 
         while calls_left > 0:
             calls_left -= 1
 
-            trace_id = self._tracer.start_call(purpose="tools-extract", messages=messages)
+            purpose = "extract" if fix_left == self._cfg.max_fix_calls else "fix"
+            trace_id = self._tracer.start(purpose, messages, tools, tool_choice)
 
             try:
-                # (2) tool schema создаётся ИМЕННО тут: response_model -> tools/tool_choice
-                # Это видно в completion:kwargs (tools/tool_choice).  [oai_citation:8‡python.useinstructor.com](https://python.useinstructor.com/concepts/hooks/?utm_source=chatgpt.com)
-                obj = self._client.chat.completions.create(
-                    model=self._config.model,
+                # >>> ВОТ ТУТ включён tool calling:
+                #     tools=... и tool_choice=... в chat.completions.create  [oai_citation:4‡platform.openai.com](https://platform.openai.com/docs/guides/function-calling?utm_source=chatgpt.com)
+                resp = self._client.chat.completions.create(
+                    model=self._cfg.model,
                     messages=messages,
-                    response_model=response_model,
-                    max_retries=0,
-                    temperature=self._config.temperature,
-                    max_tokens=self._config.max_output_tokens,
-                    hooks=self._hooks,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    temperature=self._cfg.temperature,
+                    max_tokens=self._cfg.max_output_tokens,
                 )
 
-                result = obj.model_dump(by_alias=True, exclude_none=False)
+                usage = self._extract_usage(resp)
+                self._accumulate_usage(usage_sum, usage)
 
-                # Доп. проверка: ключи должны совпадать со списком атрибутов
-                missing_keys = [a for a in attributes if a not in result]
-                extra_keys = [k for k in result.keys() if k not in set(attributes)]
-                if missing_keys or extra_keys:
-                    raise ValueError(f"missing_keys={missing_keys}, extra_keys={extra_keys}")
+                msg = resp.choices[0].message
+                last_assistant_content = getattr(msg, "content", None)
 
-                self._tracer.finish_call(
+                tool_args_raw = self._extract_tool_arguments(msg)
+                last_tool_args_raw = tool_args_raw
+
+                if tool_args_raw is None:
+                    raise ValueError("Модель не вернула tool_calls.function.arguments")
+
+                data = json.loads(tool_args_raw)
+                validated = ValidatorModel.model_validate(data)
+                result = dict(validated.root)
+
+                self._tracer.finish(
                     trace_id,
-                    assistant_text=self._ledger.last_assistant_text(),
-                    usage=self._ledger.last_usage(),
+                    assistant_content=last_assistant_content,
+                    tool_arguments_raw=tool_args_raw,
                     parsed_result=result,
+                    usage=usage,
                     error=None,
-                    provider_kwargs=self._ledger.last_provider_kwargs(),
                 )
-                return result, self._ledger.summary(), self._tracer.events()
+                return result, usage_sum, self._tracer.events()
 
             except Exception as e:
-                last_text = self._ledger.last_assistant_text()
-                self._tracer.finish_call(
+                usage = None
+                # usage можем не получить, если ошибка случилась до resp/usage
+                self._tracer.finish(
                     trace_id,
-                    assistant_text=last_text,
-                    usage=self._ledger.last_usage(),
+                    assistant_content=last_assistant_content,
+                    tool_arguments_raw=last_tool_args_raw,
                     parsed_result=None,
+                    usage=usage,
                     error=str(e),
-                    provider_kwargs=self._ledger.last_provider_kwargs(),
                 )
 
-                # Любая проблема (включая "нет атрибутов"/не tool-call/битый формат)
-                # -> делаем "тонкий" fix БЕЗ документа (экономим токены)
-                if fixes_left > 0 and calls_left > 0:
-                    fixes_left -= 1
-                    messages = self._build_minimal_fix_messages(
-                        last_assistant_text=last_text,
+                # Если это первый провал — делаем "экономичный fix" без документа:
+                if fix_left > 0 and calls_left > 0:
+                    fix_left -= 1
+                    messages = self._minimal_fix_messages(
                         attributes=attributes,
                         error=str(e),
+                        last_tool_args_or_text=last_tool_args_raw or last_assistant_content or "",
                     )
                     continue
 
                 break
 
-        return None, self._ledger.summary(), self._tracer.events()
+        return None, usage_sum, self._tracer.events()
 
-    def _build_instructor_tools_client(self):
-        default_headers = {}
-        if self._config.litellm_virtual_key:
-            default_headers[self._config.litellm_virtual_key_header] = f"Bearer {self._config.litellm_virtual_key}"
+    def _build_openai_client(self) -> OpenAI:
+        headers = {}
+        if self._cfg.litellm_virtual_key:
+            headers[self._cfg.litellm_virtual_key_header] = f"Bearer {self._cfg.litellm_virtual_key}"
             api_key = "not-used"
         else:
-            api_key = self._config.litellm_api_key
+            api_key = self._cfg.litellm_api_key
 
-        base = OpenAI(
-            base_url=self._config.litellm_base_url,
+        return OpenAI(
+            base_url=self._cfg.litellm_base_url,
             api_key=api_key,
-            default_headers=default_headers or None,
+            default_headers=headers or None,
         )
 
-        return instructor.patch(base, mode=instructor.Mode.TOOLS)
+    @staticmethod
+    def _system_prompt() -> str:
+        return (
+            "Ты извлекаешь значения атрибутов из текста страхового продукта.\n"
+            "Всегда вызывай инструмент и возвращай аргументы инструмента.\n"
+            "Не добавляй текстовых пояснений.\n"
+            "Значения бери только из входного текста. Если не найдено — null.\n"
+        )
 
     @staticmethod
-    def _build_user_payload(markdown_text: str, attributes: list[str]) -> str:
+    def _user_payload(markdown_text: str, attributes: list[str]) -> str:
         attrs = "\n".join(f"- {a}" for a in attributes)
         return (
-            "Извлеки значения атрибутов из текста страхового продукта.\n\n"
             "Список атрибутов (ключи результата должны совпадать с ними ТОЧНО):\n"
             f"{attrs}\n\n"
             "Текст (markdown, включая таблицы):\n"
@@ -423,29 +336,75 @@ class InsuranceAttributeExtractionAgent:
             "-----\n"
         )
 
-    def _build_minimal_fix_messages(self, last_assistant_text: str | None, attributes: list[str], error: str) -> list[dict]:
+    @staticmethod
+    def _minimal_fix_messages(attributes: list[str], error: str, last_tool_args_or_text: str) -> list[dict]:
         """
-        ВАЖНО: здесь нет исходного markdown.
-        Мы просим пересобрать/исправить только результат.
+        Экономия токенов: НЕ отправляем исходный markdown.
+        Просим только пересобрать/исправить результат по списку атрибутов.
         """
         attrs = "\n".join(f"- {a}" for a in attributes)
-        fix_system = (
-            "Ты — редактор результата.\n"
-            "Твоя задача — вернуть итог строго по списку атрибутов.\n"
-            "НЕ добавляй новую информацию и НЕ выдумывай значения.\n"
-            "Если значения неизвестны — ставь null.\n"
-            "Никаких пояснений.\n"
-        )
-        fix_user = (
-            f"Список атрибутов:\n{attrs}\n\n"
-            f"{self._config.format_fix_user_prompt_template.format(error=error)}"
-        )
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "Ты исправляешь результат, чтобы он строго соответствовал списку атрибутов.\n"
+                    "Всегда вызывай инструмент и возвращай аргументы инструмента.\n"
+                    "НЕ выдумывай новые значения. Только нормализуй структуру.\n"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Ошибка валидации: {error}\n\n"
+                    f"Список атрибутов (ключи):\n{attrs}\n\n"
+                    "Вот предыдущий результат (его надо исправить):\n"
+                    "-----\n"
+                    f"{last_tool_args_or_text}\n"
+                    "-----\n"
+                ),
+            },
+        ]
 
-        msgs = [{"role": "system", "content": fix_system}]
-        if last_assistant_text:
-            msgs.append({"role": "assistant", "content": last_assistant_text})
-        msgs.append({"role": "user", "content": fix_user})
-        return msgs
+    @staticmethod
+    def _extract_tool_arguments(message) -> str | None:
+        tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            return None
+        fn = getattr(tool_calls[0], "function", None)
+        if not fn:
+            return None
+        args = getattr(fn, "arguments", None)
+        return str(args) if args is not None else None
+
+    @staticmethod
+    def _extract_usage(resp) -> dict[str, int] | None:
+        usage = getattr(resp, "usage", None)
+        if usage is None:
+            return None
+
+        def g(key: str) -> int | None:
+            if isinstance(usage, dict):
+                v = usage.get(key)
+                return int(v) if v is not None else None
+            v = getattr(usage, key, None)
+            return int(v) if v is not None else None
+
+        inp = g("prompt_tokens") or g("input_tokens") or 0
+        out = g("completion_tokens") or g("output_tokens") or 0
+        total = g("total_tokens")
+        if total is None:
+            total = int(inp) + int(out)
+
+        return {"input_tokens": int(inp), "output_tokens": int(out), "total_tokens": int(total)}
+
+    @staticmethod
+    def _accumulate_usage(total: TokenUsageSummary, usage: dict[str, int] | None) -> None:
+        total.calls += 1
+        if not usage:
+            return
+        total.input_tokens += usage["input_tokens"]
+        total.output_tokens += usage["output_tokens"]
+        total.total_tokens += usage["total_tokens"]
 
 
 if __name__ == "__main__":
@@ -467,7 +426,6 @@ if __name__ == "__main__":
 | Франшиза | 10 000 ₽ |
 | Территория | РФ |
 """
-
     attrs = ["Страховая сумма", "Франшиза", "Территория", "Срок страхования 2025"]
 
     result, usage, trace = agent.extract(md_text, attrs)
@@ -475,10 +433,11 @@ if __name__ == "__main__":
     print("RESULT:", result)
     print("USAGE:", usage.model_dump())
 
-    # Отладка: посмотреть tools/tool_choice (в provider_kwargs_compact)
     print("\nTRACE EVENTS:", len(trace))
     for ev in trace:
-        print(f"\n--- CALL #{ev.index} ---")
-        print("provider_kwargs:", ev.provider_kwargs_compact)
+        print(f"\n--- CALL #{ev.index} purpose={ev.purpose} ---")
+        print("tools_count:", ev.tools_count, "tool_choice:", ev.tool_choice)
         print("usage:", ev.usage)
         print("error:", ev.error)
+        if ev.tool_arguments_raw:
+            print("tool_arguments_raw:", ev.tool_arguments_raw[:300], "..." if len(ev.tool_arguments_raw) > 300 else "")
