@@ -1,220 +1,185 @@
 import re
-from dataclasses import dataclass
-from typing import Iterable
 
-from rapidfuzz import fuzz, process
-
-
-# -------------------------
-# Настройки/результаты
-# -------------------------
-
-@dataclass(frozen=True)
-class MatchInfo:
-    attribute: str
-    matched_key: str | None
-    score: float
-    line_index: int | None
-    value: str | None
+from docx import Document
+from rapidfuzz import fuzz
 
 
-@dataclass(frozen=True)
-class Candidate:
-    line_index: int
-    raw_line: str
-    key: str
-    value: str
-    key_norm: str
+_WS = re.compile(r"\s+")
+_JUNK = re.compile(r"[^0-9a-zA-Zа-яА-ЯёЁ%№\s]+")
 
 
-# -------------------------
-# Нормализация строк
-# -------------------------
+def _norm(s: str) -> str:
+    s = (s or "").strip().casefold().replace("ё", "е")
+    s = _JUNK.sub(" ", s)
+    s = _WS.sub(" ", s).strip()
+    return s
 
-_WS_RE = re.compile(r"\s+")
-_JUNK_RE = re.compile(r"[^0-9a-zA-Zа-яА-ЯёЁ%№\s]+")  # оставляем буквы/цифры/пробел/несколько символов
 
-def normalize_key(s: str) -> str:
+def _unique_row_cells(row) -> list:
     """
-    Нормализация только для сравнения (fuzzy).
-    Сами атрибуты и ключи НЕ меняем — возвращаем оригиналы, а сравниваем normalized.
+    row.cells может содержать дубликаты для merged-cells.  [oai_citation:6‡Stack Overflow](https://stackoverflow.com/questions/48090922/python-docx-row-cells-return-a-merged-cell-multiple-times?utm_source=chatgpt.com)
+    Дедуп по identity xml-ячейки (_tc).
     """
-    t = s.strip().casefold()
-    t = t.replace("ё", "е")
-    t = _JUNK_RE.sub(" ", t)          # пунктуацию -> пробел
-    t = _WS_RE.sub(" ", t).strip()    # схлопываем пробелы
-    return t
-
-
-# -------------------------
-# Детектор "табличной" строки и разбор ячеек
-# -------------------------
-
-# Типовая строка-разделитель markdown таблицы: | --- | ---: | :--- |
-# (может быть с пробелами). Мы такие пропускаем.
-_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*[:\- ]+\s*(\|\s*[:\- ]+\s*)+\|?\s*$")
-
-def is_candidate_table_line(line: str) -> bool:
-    if "|" not in line:
-        return False
-    # слишком мало пайпов — скорее не таблица
-    if line.count("|") < 2:
-        return False
-    # разделитель/шапка таблицы
-    if _TABLE_SEPARATOR_RE.match(line):
-        return False
-    return True
-
-
-def split_pipe_cells(line: str) -> list[str]:
-    """
-    Толерантный сплит по '|'.
-    Убираем внешние '|' если есть, но НЕ требуем идеальной таблицы.
-    """
-    s = line.strip()
-    # убрать крайние пайпы (часто они есть, но не всегда)
-    if s.startswith("|"):
-        s = s[1:]
-    if s.endswith("|"):
-        s = s[:-1]
-    cells = [c.strip() for c in s.split("|")]
-    return cells
-
-
-def extract_key_value_from_cells(cells: list[str]) -> tuple[str, str] | None:
-    """
-    Делает (key, value) из набора ячеек с разным количеством колонок.
-    Правило: берём ПЕРВУЮ непустую ячейку как key, всё что справа — value.
-    """
-    # найти индекс первого непустого
-    key_idx = None
-    for i, c in enumerate(cells):
-        if c:
-            key_idx = i
-            break
-    if key_idx is None:
-        return None
-
-    key = cells[key_idx].strip()
-    # value = всё справа от key_idx, включая пустые, но лучше убрать крайние пустоты
-    right = [c.strip() for c in cells[key_idx + 1 :]]
-    # если справа всё пустое, пробуем распознать формат "Ключ: значение" в самом key
-    if not any(right):
-        if ":" in key:
-            k, v = key.split(":", 1)
-            k = k.strip()
-            v = v.strip()
-            if k:
-                return (k, v)
-        return None
-
-    # собираем value
-    value = " | ".join([c for c in right if c != ""]).strip()
-    if not value:
-        return None
-
-    # если key содержит двоеточие, иногда это "Ключ: ..." и справа тоже что-то — оставим как есть
-    return (key, value)
-
-
-def extract_candidates_from_markdown(markdown_text: str) -> list[Candidate]:
-    """
-    1) Идём построчно.
-    2) Игнорируем code blocks ```...```.
-    3) Берём все строки с '|' (кроме разделителей).
-    4) Для каждой строки пытаемся извлечь (key,value).
-    """
-    candidates: list[Candidate] = []
-    in_code_block = False
-
-    for idx, raw_line in enumerate(markdown_text.splitlines()):
-        line = raw_line.rstrip("\n")
-
-        # toggling code fences
-        if line.strip().startswith("```"):
-            in_code_block = not in_code_block
+    uniq = []
+    seen = set()
+    for c in row.cells:
+        tc = getattr(c, "_tc", None)
+        key = id(tc) if tc is not None else id(c)
+        if key in seen:
             continue
-        if in_code_block:
-            continue
-
-        if not is_candidate_table_line(line):
-            continue
-
-        cells = split_pipe_cells(line)
-        if len(cells) < 2:
-            continue
-
-        kv = extract_key_value_from_cells(cells)
-        if kv is None:
-            continue
-        key, value = kv
-
-        candidates.append(
-            Candidate(
-                line_index=idx,
-                raw_line=line,
-                key=key,
-                value=value,
-                key_norm=normalize_key(key),
-            )
-        )
-
-    return candidates
+        seen.add(key)
+        uniq.append(c)
+    return uniq
 
 
-# -------------------------
-# Матчинг атрибутов по кандидатам
-# -------------------------
+def _table_to_text(table, depth: int = 0, max_depth: int = 5) -> str:
+    """
+    Сериализация таблицы в простой текст.
+    Вложенные таблицы тоже печатаем (но ограничиваем глубину на всякий случай).
+    """
+    if depth > max_depth:
+        return ""
 
-def match_attributes_from_markdown(
-    markdown_text: str,
+    lines = []
+    for row in table.rows:
+        cells = _unique_row_cells(row)
+        cell_texts = []
+        for cell in cells:
+            cell_texts.append(_cell_to_text(cell, depth=depth + 1, max_depth=max_depth))
+        # как “рядом” — через разделитель
+        row_line = " | ".join([t for t in cell_texts if t.strip() != ""]).strip()
+        if row_line:
+            lines.append(row_line)
+
+    return "\n".join(lines).strip()
+
+
+def _cell_to_text(cell, depth: int = 0, max_depth: int = 5) -> str:
+    """
+    Берём весь текст ячейки:
+    - параграфы
+    - вложенные таблицы (как текст подряд)  [oai_citation:7‡GitHub](https://github.com/python-openxml/python-docx/issues/769?utm_source=chatgpt.com)
+    """
+    parts = []
+
+    # параграфы
+    for p in cell.paragraphs:
+        t = (p.text or "").strip()
+        if t:
+            parts.append(t)
+
+    # вложенные таблицы
+    for t in cell.tables:
+        tt = _table_to_text(t, depth=depth + 1, max_depth=max_depth)
+        if tt:
+            parts.append(tt)
+
+    return "\n".join(parts).strip()
+
+
+def _iter_tables_recursive(tables) -> list:
+    """
+    Возвращает список всех таблиц в порядке обхода:
+    - текущие tables
+    - затем вложенные из каждой ячейки (рекурсивно)
+    """
+    all_tables = []
+    for table in tables:
+        all_tables.append(table)
+        for row in table.rows:
+            for cell in _unique_row_cells(row):
+                nested = cell.tables  # nested tables живут отдельно  [oai_citation:8‡GitHub](https://github.com/python-openxml/python-docx/issues/769?utm_source=chatgpt.com)
+                if nested:
+                    all_tables.extend(_iter_tables_recursive(nested))
+    return all_tables
+
+
+def extract_mapping_from_docx(
+    docx_path: str,
     attributes: list[str],
     threshold: float = 85.0,
-) -> tuple[dict[str, str | None], float, list[MatchInfo]]:
+) -> tuple[dict, float, list]:
     """
-    Возвращает:
-      1) mapping: dict[attr -> value|None]
-      2) recall: найдено / всего
-      3) details: список MatchInfo (для отладки/подбора threshold)
+    mapping: attr -> value|None
+    recall: found/total
+    details: список (attr, score, table_idx, row_idx, matched_cell_idx)
     """
 
-    candidates = extract_candidates_from_markdown(markdown_text)
+    doc = Document(docx_path)
+    tables = _iter_tables_recursive(doc.tables)
 
-    # если кандидатов нет — всё None
-    if not candidates:
-        mapping = {a: None for a in attributes}
-        details = [MatchInfo(a, None, 0.0, None, None) for a in attributes]
-        return mapping, 0.0, details
+    mapping = {a: None for a in attributes}
+    details = []
 
-    # список normalized ключей (для RapidFuzz)
-    keys_norm = [c.key_norm for c in candidates]
-
-    mapping: dict[str, str | None] = {}
-    details: list[MatchInfo] = []
     found = 0
 
+    # Чтобы было “самое раннее”, сканируем таблицы/строки сверху вниз
+    # и для каждого attr берём ПЕРВУЮ строку, которая проходит threshold.
     for attr in attributes:
-        attr_norm = normalize_key(attr)
+        attr_n = _norm(attr)
 
-        # extractOne вернёт лучший матч (match, score, index)  [oai_citation:2‡GitHub](https://github.com/rapidfuzz/RapidFuzz?utm_source=chatgpt.com)
-        best = process.extractOne(
-            attr_norm,
-            keys_norm,
-            scorer=fuzz.token_set_ratio,   # устойчиво к перестановкам/лишним словам  [oai_citation:3‡datacamp.com](https://www.datacamp.com/tutorial/fuzzy-string-python?utm_source=chatgpt.com)
-            score_cutoff=threshold,
-        )
+        matched = False
+        best_seen_score = 0.0
+        best_seen_info = None
 
-        if best is None:
-            mapping[attr] = None
-            details.append(MatchInfo(attr, None, 0.0, None, None))
-            continue
+        for ti, table in enumerate(tables):
+            for ri, row in enumerate(table.rows):
+                cells = _unique_row_cells(row)
+                cell_texts = [_cell_to_text(c) for c in cells]
 
-        matched_norm, score, cand_idx = best
-        cand = candidates[cand_idx]
+                # найдём лучшую ячейку в строке по score
+                best_score = 0.0
+                best_ci = None
 
-        mapping[attr] = cand.value
-        details.append(MatchInfo(attr, cand.key, float(score), cand.line_index, cand.value))
-        found += 1
+                for ci, txt in enumerate(cell_texts):
+                    txt_n = _norm(txt)
+                    if not txt_n:
+                        continue
+                    score = float(fuzz.WRatio(attr_n, txt_n))  # общий скорер  [oai_citation:9‡RapidFuzz](https://rapidfuzz.github.io/RapidFuzz/Usage/fuzz.html?utm_source=chatgpt.com)
+                    if score > best_score:
+                        best_score = score
+                        best_ci = ci
+
+                if best_score > best_seen_score:
+                    best_seen_score = best_score
+                    best_seen_info = (ti, ri, best_ci)
+
+                if best_ci is None:
+                    continue
+
+                if best_score >= threshold:
+                    # Значение = все остальные ячейки в строке (кроме matched cell)
+                    value_parts = []
+                    for ci, txt in enumerate(cell_texts):
+                        if ci == best_ci:
+                            continue
+                        tt = (txt or "").strip()
+                        if tt:
+                            value_parts.append(tt)
+
+                    value = "\n".join(value_parts).strip()
+                    if not value:
+                        # пустое значение = считаем не найдено
+                        mapping[attr] = None
+                        details.append((attr, best_score, ti, ri, best_ci, "EMPTY_VALUE"))
+                    else:
+                        mapping[attr] = value
+                        found += 1
+                        details.append((attr, best_score, ti, ri, best_ci, "OK"))
+
+                    matched = True
+                    break
+
+            if matched:
+                break
+
+        if not matched:
+            # чтобы ты мог крутить threshold — отдаём лучший score, который вообще встречался
+            if best_seen_info is None:
+                details.append((attr, 0.0, None, None, None, "NO_MATCH"))
+            else:
+                ti, ri, ci = best_seen_info
+                details.append((attr, best_seen_score, ti, ri, ci, "BELOW_THRESHOLD"))
 
     recall = found / max(1, len(attributes))
     return mapping, recall, details
