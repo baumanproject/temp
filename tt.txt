@@ -1,0 +1,245 @@
+#############################################
+# POSTGRESQL
+#############################################
+POSTGRES_DB=langflow
+POSTGRES_USER=langflow
+POSTGRES_PASSWORD=CHANGE_ME_STRONG
+
+#############################################
+# AUTHENTICATION / API KEYS
+#############################################
+LANGFLOW_AUTO_LOGIN=False                # отключено авто-логин: требуется login/UI auth
+LANGFLOW_SUPERUSER=admin                 # имя суперпользователя
+LANGFLOW_SUPERUSER_PASSWORD=CHANGE_ME_SUPER_SECRET
+LANGFLOW_SECRET_KEY=GENERATE_STRONG_SECRET
+
+# Источник API ключей (db либо env)
+LANGFLOW_API_KEY_SOURCE=db
+
+# Удалять/не хранить API ключи в flow данных
+LANGFLOW_REMOVE_API_KEYS=True
+
+#############################################
+# LOGGING / OBSERVABILITY
+#############################################
+LANGFLOW_LOG_LEVEL=info                  # уровень: debug/info/warning/error/critical
+LANGFLOW_LOG_RETRIEVER_BUFFER_SIZE=20000  # сколько логов можно получить через /logs API
+
+# (опционально) Langfuse observability
+LANGFUSE_HOST=
+LANGFUSE_PUBLIC_KEY=
+LANGFUSE_SECRET_KEY=
+
+#############################################
+# PERFORMANCE / WORKERS
+#############################################
+# Количество worker-процессов для обработки запросов
+# Оптимально: (CPU cores * 2) + 1
+LANGFLOW_WORKERS=2
+
+#############################################
+# CACHE SETTINGS
+#############################################
+# Тип кеша: async (по умолчанию), memory или другой
+LANGFLOW_CACHE_TYPE=async
+# Кеш для Langchain: InMemoryCache или другой
+LANGFLOW_LANGCHAIN_CACHE=InMemoryCache
+
+#############################################
+# OFFLINE / EXTERNAL DISABLE (NO INTERNET)
+#############################################
+# Отключить платформенную телеметрию Langflow
+DO_NOT_TRACK=True
+
+# Не создавать starter flows и не тянуть обновления из интернета
+LANGFLOW_CREATE_STARTER_PROJECTS=False
+LANGFLOW_UPDATE_STARTER_PROJECTS=False
+
+# Список bundle URL’ов (оставляем пустым)
+LANGFLOW_BUNDLE_URLS=[]
+
+# Отключает автоматическое добавление env vars как global vars
+LANGFLOW_STORE_ENVIRONMENT_VARIABLES=False
+LANGFLOW_FALLBACK_TO_ENV_VAR=False
+
+#############################################
+# REDIS
+#############################################
+# Redis параметры
+# (см. docker-compose, Redis доступ на 6379)
+REDIS_HOST=redis
+REDIS_PORT=6379
+
+#############################################
+# HF HUB / MACHINE LEARNING OFFLINE
+#############################################
+# HF Hub offline (не делает HTTP-запросов к HF)
+HF_HUB_OFFLINE=1
+# Отключить телеметрию HF libs
+HF_HUB_DISABLE_TELEMETRY=1
+
+# Если нет GPU (CPU-only), скрываем устройства CUDA
+NVIDIA_VISIBLE_DEVICES=none
+
+#############################################
+# DATABASE CONNECTION SETTINGS (optional)
+#############################################
+# Повтор подключения при ошибках
+LANGFLOW_DATABASE_CONNECTION_RETRY=false
+# Таймаут подключения в секундах
+LANGFLOW_DB_CONNECT_TIMEOUT=30
+# Доп. pool settings в JSON
+LANGFLOW_DB_CONNECTION_SETTINGS='{"pool_size":10,"max_overflow":20,"pool_timeout":30,"pool_pre_ping":true}'
+
+
+
+
+
+
+  version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: langflow-postgres
+    restart: unless-stopped
+
+    ports:
+      # Открываем порт наружу, чтобы можно было анализировать БД напрямую
+      - "5432:5432"
+
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}              # Имя базы
+      - POSTGRES_USER=${POSTGRES_USER}          # Пользователь
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}  # Пароль
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    networks:
+      - langflow_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: langflow-redis
+    restart: unless-stopped
+
+    ports:
+      # Redis доступен извне (анализ/мониторинг)
+      - "6379:6379"
+
+    volumes:
+      - redis_data:/data
+
+    networks:
+      - langflow_net
+
+  langflow:
+    image: langflowai/langflow:1.7.2  # зафиксированная стабильная версия
+    container_name: langflow
+    restart: unless-stopped
+
+    depends_on:
+      - postgres
+      - redis
+
+    ports:
+      # Проброс UI/API Langflow наружу
+      - "${LANGFLOW_PORT}:7860"
+
+    environment:
+      ###############################################
+      # CORE / SERVER
+      ###############################################
+      - LANGFLOW_HOST=0.0.0.0                    # слушать на всех интерфейсах
+      - LANGFLOW_PORT=7860                       # порт внутри контейнера
+
+      ###############################################
+      # DATABASE
+      ###############################################
+      # URL подключения PostgreSQL
+      - "LANGFLOW_DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
+
+      ###############################################
+      # AUTHENTICATION
+      ###############################################
+      - LANGFLOW_AUTO_LOGIN=${LANGFLOW_AUTO_LOGIN}              # авто вход (True/False)
+      - LANGFLOW_SUPERUSER=${LANGFLOW_SUPERUSER}                # имя суперпользователя
+      - LANGFLOW_SUPERUSER_PASSWORD=${LANGFLOW_SUPERUSER_PASSWORD}  # пароль суперпользователя
+      - LANGFLOW_SECRET_KEY=${LANGFLOW_SECRET_KEY}              # секретный ключ шифрования
+      - LANGFLOW_API_KEY_SOURCE=${LANGFLOW_API_KEY_SOURCE}      # откуда брать API ключи (db/env)
+
+      # Безопасность API ключей в flow-данных
+      - LANGFLOW_REMOVE_API_KEYS=${LANGFLOW_REMOVE_API_KEYS}
+
+      ###############################################
+      # LOGGING / OBSERVABILITY
+      ###############################################
+      - LANGFLOW_LOG_ENV=container                  # JSON формат логов для аггрегатора
+      - LANGFLOW_LOG_LEVEL=${LANGFLOW_LOG_LEVEL}    # уровень логирования
+      - LANGFLOW_ENABLE_LOG_RETRIEVAL=True          # включить лог API (/logs, /logs-stream)
+      - LANGFLOW_LOG_RETRIEVER_BUFFER_SIZE=${LANGFLOW_LOG_RETRIEVER_BUFFER_SIZE}  # буфер логов
+
+      # (опционально) Интеграция с наблюдением Langfuse
+      - LANGFUSE_HOST=${LANGFUSE_HOST}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+
+      ###############################################
+      # WORKFLOW / PERFORMANCE
+      ###############################################
+      - LANGFLOW_WORKERS=${LANGFLOW_WORKERS}        # worker-процессы (параллелизм)
+
+      ###############################################
+      # CACHE / MEMORY
+      ###############################################
+      - LANGFLOW_CACHE_TYPE=${LANGFLOW_CACHE_TYPE}          # тип кеша
+      - LANGFLOW_LANGCHAIN_CACHE=${LANGFLOW_LANGCHAIN_CACHE}  # кеш Langchain (InMemory, async)
+
+      ###############################################
+      # OFFLINE / EXTERNAL SERVICES DISABLE
+      ###############################################
+      - DO_NOT_TRACK=${DO_NOT_TRACK}                # отключить телеметрию
+      - LANGFLOW_CREATE_STARTER_PROJECTS=${LANGFLOW_CREATE_STARTER_PROJECTS}  # не тянуть starter flows
+      - LANGFLOW_UPDATE_STARTER_PROJECTS=${LANGFLOW_UPDATE_STARTER_PROJECTS}  # не обновлять starter flows
+      - LANGFLOW_BUNDLE_URLS=${LANGFLOW_BUNDLE_URLS}    # пустой список, чтобы не тянуть bundle URL’ы
+
+      # Отключает Langflow попытки source env vars как global vars
+      - LANGFLOW_STORE_ENVIRONMENT_VARIABLES=${LANGFLOW_STORE_ENVIRONMENT_VARIABLES}
+      - LANGFLOW_FALLBACK_TO_ENV_VAR=${LANGFLOW_FALLBACK_TO_ENV_VAR}
+
+      ###############################################
+      # REDIS (для агентов / компонентов)
+      ###############################################
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+      ###############################################
+      # HF / ML OFFLINE SETTINGS (если используешь модели
+      # локально и без интернета)
+      ###############################################
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE}             # HF Hub offline (не ходит на https://huggingface.co)
+      - HF_HUB_DISABLE_TELEMETRY=${HF_HUB_DISABLE_TELEMETRY}  # отключить HF телеметрию
+
+      # Если нет GPU и не используем внешние CUDA, скрываем их
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES}
+
+      ###############################################
+      # OTHER OPTIONAL SETTINGS
+      ###############################################
+      # Настройки пула DB (по необходимости)
+      - LANGFLOW_DATABASE_CONNECTION_RETRY=${LANGFLOW_DATABASE_CONNECTION_RETRY}
+      - LANGFLOW_DB_CONNECT_TIMEOUT=${LANGFLOW_DB_CONNECT_TIMEOUT}
+      - LANGFLOW_DB_CONNECTION_SETTINGS=${LANGFLOW_DB_CONNECTION_SETTINGS}
+
+    volumes:
+      - langflow_config:/app/langflow  # конфиг/логи/файлы
+    networks:
+      - langflow_net
+
+volumes:
+  postgres_data:
+  redis_data:
+  langflow_config:
+
+networks:
+  langflow_net:
