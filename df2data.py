@@ -7,12 +7,11 @@ from lfx.inputs.inputs import HandleInput
 from lfx.schema.data import Data
 from lfx.schema.message import Message
 from lfx.template.field.base import Output
-from lfx.utils.constants import MESSAGE_SENDER_AI, MESSAGE_SENDER_USER
 
 
 class MinimalChatHistoryAdapter(Component):
     display_name = "Minimal Chat History Adapter"
-    description = "Converts history rows to chat history for Tool Calling Agent."
+    description = "Converts history rows to Message list for Tool Calling Agent Chat Memory."
     name = "MinimalChatHistoryAdapter"
     icon = "messages-square"
 
@@ -30,6 +29,8 @@ class MinimalChatHistoryAdapter(Component):
             name="chat_history",
             display_name="Chat History",
             method="build_chat_history",
+            types=["Data"],
+            selected="Data",
         ),
     ]
 
@@ -39,28 +40,36 @@ class MinimalChatHistoryAdapter(Component):
         messages: list[Message] = []
 
         for row in rows:
-            text = row.get("text") or row.get("message") or row.get("content")
+            clean_row = self._unwrap_row(row)
+
+            text = (
+                clean_row.get("text")
+                or clean_row.get("message")
+                or clean_row.get("content")
+            )
 
             if not text:
                 continue
 
             sender = self._normalize_sender(
-                row.get("sender") or row.get("role") or row.get("sender_name")
+                clean_row.get("sender")
+                or clean_row.get("role")
+                or clean_row.get("sender_name")
             )
 
             messages.append(
                 Message(
                     text=str(text),
                     sender=sender,
-                    sender_name="User" if sender == MESSAGE_SENDER_USER else "AI",
-                    session_id=str(row.get("session_id") or ""),
+                    sender_name="User" if sender == "User" else "AI",
+                    session_id=str(clean_row.get("session_id") or ""),
                 )
             )
 
-        self.status = {
-            "input_rows": len(rows),
-            "output_messages": len(messages),
-        }
+        self.log(
+            f"Chat history adapter: input_rows={len(rows)}, output_messages={len(messages)}",
+            name="chat_history_adapter_debug",
+        )
 
         return messages
 
@@ -68,28 +77,39 @@ class MinimalChatHistoryAdapter(Component):
     def _normalize_sender(value: Any) -> str:
         sender = str(value or "").strip().lower()
 
-        if sender in {"user", "human"}:
-            return MESSAGE_SENDER_USER
+        if sender in {"user", "human", "person"}:
+            return "User"
 
-        return MESSAGE_SENDER_AI
+        return "Machine"
 
     @staticmethod
-    def _to_rows(history: Any) -> list[dict[str, Any]]:
+    def _unwrap_row(row: Any) -> dict[str, Any]:
+        if isinstance(row, Message):
+            return row.data
+
+        if isinstance(row, Data):
+            return row.data
+
+        if isinstance(row, dict):
+            nested_data = row.get("data")
+
+            if isinstance(nested_data, dict):
+                return nested_data
+
+            return row
+
+        if hasattr(row, "data") and isinstance(row.data, dict):
+            return row.data
+
+        return {}
+
+    @classmethod
+    def _to_rows(cls, history: Any) -> list[dict[str, Any]]:
         if history is None:
             return []
 
         if isinstance(history, list):
-            result = []
-
-            for item in history:
-                if isinstance(item, Message):
-                    result.append(item.data)
-                elif isinstance(item, Data):
-                    result.append(item.data)
-                elif isinstance(item, dict):
-                    result.append(item)
-
-            return result
+            return [cls._unwrap_row(item) for item in history]
 
         if isinstance(history, Message):
             return [history.data]
@@ -98,15 +118,27 @@ class MinimalChatHistoryAdapter(Component):
             data = history.data
 
             if isinstance(data, list):
-                return [item for item in data if isinstance(item, dict)]
+                return [cls._unwrap_row(item) for item in data]
 
             if isinstance(data, dict):
-                return [data]
+                return [cls._unwrap_row(data)]
 
         if hasattr(history, "to_dict"):
             try:
-                return history.to_dict(orient="records")
+                records = history.to_dict(orient="records")
+
+                if isinstance(records, list):
+                    return [cls._unwrap_row(item) for item in records]
             except TypeError:
                 return []
+
+        if hasattr(history, "data"):
+            data = history.data
+
+            if isinstance(data, list):
+                return [cls._unwrap_row(item) for item in data]
+
+            if isinstance(data, dict):
+                return [cls._unwrap_row(data)]
 
         return []
