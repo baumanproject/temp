@@ -142,3 +142,55 @@ class MinimalChatHistoryAdapter(Component):
                 return [cls._unwrap_row(data)]
 
         return []
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from __future__ import annotations
+
+from langchain.agents import AgentExecutor
+from langchain.agents.agent import RunnableAgent
+
+from lfx.components.langchain_utilities.tool_calling import ToolCallingAgentComponent
+
+
+class FixedToolCallingAgentComponent(ToolCallingAgentComponent):
+    display_name = "Fixed Tool Calling Agent"
+    description = "Tool Calling Agent with tools=None fixed for Langflow 1.7.2."
+    name = "FixedToolCallingAgent"
+    icon = "LangChain"
+
+    def build_agent(self) -> AgentExecutor:
+        # Ключевой фикс для Langflow 1.7.2:
+        # встроенный LCToolsAgentComponent передаёт tools=self.tools,
+        # а если tools не подключены, self.tools == None.
+        tools = self.tools or []
+
+        self.tools = tools
+        self.validate_tool_names()
+
+        agent = self.create_agent_runnable()
+
+        return AgentExecutor.from_agent_and_tools(
+            agent=RunnableAgent(
+                runnable=agent,
+                input_keys_arg=["input"],
+                return_keys_arg=["output"],
+            ),
+            tools=tools,
+            **self.get_agent_kwargs(flatten=True),
+        )
